@@ -1,0 +1,29 @@
+# Byte-compiled / Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# PyTorch & YOLO Weights (MUST be ignored to keep GitHub repo tiny)
+*.pt
+*.onnx
+*.engine
+
+# Media & Datasets
+*.mp4
+*.avi
+*.mov
+*.jpg
+*.jpeg
+*.png
+data/outputs/*
+!data/outputs/.gitkeep
+data/samples/*
+!data/samples/.gitkeep
+
+# Environment & IDE
+.venv/
+venv/
+ENV/
+.idea/
+.vscode/
+.ipynb_checkpoints/
