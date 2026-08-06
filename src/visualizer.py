@@ -1,6 +1,6 @@
 import cv2
 
-class CityVisualizer:
+class Visualizer:
     def __init__(self):
         # Color palette (BGR format)
         self.COLOR_PEDESTRIAN = (0, 255, 0)     # Green
