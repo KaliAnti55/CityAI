@@ -1,6 +1,6 @@
 import numpy as np
 
-class CityDetector:
+class CityMobilityDetector:
     def __init__(self, model, conf_thresh=0.25, iop_thresh=0.45):
         self.model = model
         self.conf_thresh = conf_thresh
@@ -128,3 +128,4 @@ class CityDetector:
         }
         
         return telemetry
+    
