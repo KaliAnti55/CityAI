@@ -1,8 +1,14 @@
 import numpy as np
+from ultralytics import YOLO
 
-class CityMobilityDetector:
-    def __init__(self, model, conf_thresh=0.25, iop_thresh=0.45):
-        self.model = model
+class CityDetector:
+    def __init__(self, model_path="yolov8x.pt", conf_thresh=0.25, iop_thresh=0.45):
+        # Accept either a loaded YOLO object or a string file path
+        if isinstance(model_path, str):
+            self.model = YOLO(model_path)
+        else:
+            self.model = model_path
+            
         self.conf_thresh = conf_thresh
         self.iop_thresh = iop_thresh
         
@@ -23,18 +29,13 @@ class CityMobilityDetector:
         }
 
     def compute_feet_iop(self, ped_box, veh_box):
-        """
-        Calculates Intersection over Person (IoP) focusing strictly on 
-        the pedestrian's lower body/feet area to eliminate perspective depth stacking.
-        """
         px1, py1, px2, py2 = ped_box
         vx1, vy1, vx2, vy2 = veh_box
         
-        # Focus on the lower 25% of the pedestrian bounding box (feet/base contact)
+        # Focus on lower 25% of pedestrian bounding box (feet/ground contact)
         ped_height = py2 - py1
         feet_py1 = py2 - (ped_height * 0.25)
         
-        # Calculate intersection area between pedestrian feet zone and vehicle box
         ix1 = max(px1, vx1)
         iy1 = max(feet_py1, vy1)
         ix2 = min(px2, vx2)
@@ -57,7 +58,6 @@ class CityMobilityDetector:
         rider_eligible_vehicles = []
         enclosed_vehicles = []
         
-        # 1. Parse detected objects into categories
         if results.boxes is not None:
             for box in results.boxes:
                 cls_id = int(box.cls[0].item())
@@ -84,7 +84,6 @@ class CityMobilityDetector:
         active_riders = []
         standalone_pedestrians = []
         
-        # 2. Match pedestrians to open micro-mobility vehicles using feet-anchored IoP
         for ped in pedestrians:
             is_rider = False
             best_iop = 0.0
@@ -108,7 +107,6 @@ class CityMobilityDetector:
                 
         all_vehicles = rider_eligible_vehicles + enclosed_vehicles
         
-        # 3. Build telemetry object
         telemetry = {
             'counts': {
                 'pedestrians': len(standalone_pedestrians),
@@ -128,4 +126,6 @@ class CityMobilityDetector:
         }
         
         return telemetry
-    
+
+# Alias for backward compatibility with main.py
+CityMobilityDetector = CityDetector
