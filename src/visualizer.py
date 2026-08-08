@@ -6,6 +6,7 @@ class Visualizer:
         self.COLOR_PEDESTRIAN = (0, 255, 0)     # Green
         self.COLOR_RIDER = (0, 0, 255)          # Red
         self.COLOR_VEHICLE = (255, 191, 0)      # Deep Blue/Cyan
+        self.COLOR_HOTLIST = (0, 0, 255)        # Bright Red
         self.COLOR_LINE = (0, 255, 255)         # Yellow connector line
         self.COLOR_BANNER_BG = (30, 30, 30)     # Dark overlay background
         self.COLOR_TEXT = (255, 255, 255)       # White
@@ -23,16 +24,22 @@ class Visualizer:
             cv2.putText(img, label, (x1, max(y1 - 6, 15)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, self.COLOR_PEDESTRIAN, 1)
 
-        # 2. Draw All Vehicles (Deep Blue/Cyan)
+        # 2. Draw All Vehicles (Deep Blue/Cyan; Bright Red when hotlist matched)
         for veh in telemetry.get('vehicles', []):
             x1, y1, x2, y2 = map(int, veh['bbox'])
-            cv2.rectangle(img, (x1, y1), (x2, y2), self.COLOR_VEHICLE, 2)
+            is_hotlist = bool(veh.get('hotlist_match'))
+            color = self.COLOR_HOTLIST if is_hotlist else self.COLOR_VEHICLE
+            thickness = 3 if is_hotlist else 2
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, thickness)
             track_id = veh.get('track_id')
-            label = (f"{veh['class'].upper()} #{track_id} {veh['confidence']}"
-                     if track_id is not None
-                     else f"{veh['class'].upper()} {veh['confidence']}")
+            if is_hotlist:
+                label = f"HOTLIST {veh['class'].upper()} #{track_id} {veh['confidence']}"
+            elif track_id is not None:
+                label = f"{veh['class'].upper()} #{track_id} {veh['confidence']}"
+            else:
+                label = f"{veh['class'].upper()} {veh['confidence']}"
             cv2.putText(img, label, (x1, max(y1 - 6, 15)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, self.COLOR_VEHICLE, 1)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
         # 3. Draw Active Riders (Red) and connecting lines to their bike/motorcycle
         for rider in telemetry.get('active_riders', []):

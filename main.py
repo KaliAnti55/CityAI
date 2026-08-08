@@ -32,9 +32,11 @@ def record_vehicle_crops(frame, telemetry, memory):
     """Persist vehicle and license plate crops for newly tracked vehicles.
 
     A full vehicle crop is saved once per unique ``track_id``; for enclosed
-    vehicle classes (car, bus, truck) a license plate region crop is saved
-    alongside it. Crop paths are attached to the vehicle telemetry entries
-    on first save.
+    vehicle classes (car, bus, truck) a license plate crop is saved
+    alongside it and OCR-recognized plate text is attached to the
+    telemetry entry. Crop paths are attached on first save; ``plate_text``
+    is set to null when OCR is unavailable or recognition failed. Vehicles
+    whose plate matched the hotlist are flagged with ``hotlist_match``.
     """
     for vehicle in telemetry.get('vehicles', []):
         track_id = vehicle.get('track_id')
@@ -48,6 +50,9 @@ def record_vehicle_crops(frame, telemetry, memory):
             plate_path = memory.save_plate_crop(frame, vehicle['bbox'], track_id, vehicle_class)
             if plate_path is not None:
                 vehicle['plate_crop_path'] = plate_path
+            vehicle['plate_text'] = memory.get_plate_text(track_id)
+            if memory.is_hotlist_match(track_id):
+                vehicle['hotlist_match'] = True
 
 def parse_args():
     parser = argparse.ArgumentParser(description="CityAI - Urban Mobility Analytics")
@@ -60,6 +65,12 @@ def parse_args():
     parser.add_argument("--iop-thresh", type=float, default=0.45, help="Feet IoP threshold for riders")
     parser.add_argument("--no-display", action="store_true", help="Disable GUI display window")
     parser.add_argument("--save-json", action="store_true", help="Save output telemetry JSON")
+    parser.add_argument("--telegram-token", type=str, default=None,
+                        help="Telegram Bot Token for hotlist plate alerts")
+    parser.add_argument("--telegram-chat-id", type=str, default=None,
+                        help="Telegram target Chat ID for hotlist plate alerts")
+    parser.add_argument("--target-plates", type=str, default=None,
+                        help="Comma-separated hotlist license plates (e.g., \"ABC1234,XYZ789,1234\")")
     return parser.parse_args()
 
 def main():
@@ -70,10 +81,24 @@ def main():
     
     detector = CityMobilityDetector(model_path=args.weights, conf_thresh=args.conf, iop_thresh=args.iop_thresh)
     visualizer = Visualizer()
-    memory = CropMemory(plate_model=args.plate_weights)
+    target_plates = set()
+    if args.target_plates:
+        target_plates = {p.strip() for p in args.target_plates.split(',') if p.strip()}
+    memory = CropMemory(plate_model=args.plate_weights, target_plates=target_plates,
+                        telegram_token=args.telegram_token,
+                        telegram_chat_id=args.telegram_chat_id)
     if memory.plate_model is None:
         print(f"[-] Plate model '{args.plate_weights}' unavailable; "
               f"falling back to geometric plate heuristic")
+    if memory.target_plates:
+        print(f"[*] Hotlist plates loaded: {', '.join(sorted(memory.target_plates))}")
+    if args.telegram_token or args.telegram_chat_id:
+        if memory.telegram_enabled:
+            print("[+] Telegram hotlist alerts enabled")
+        else:
+            print("[-] Telegram alerts disabled: both --telegram-token and "
+                  f"--telegram-chat-id are required (token={bool(args.telegram_token)}, "
+                  f"chat_id={bool(args.telegram_chat_id)})")
     
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():

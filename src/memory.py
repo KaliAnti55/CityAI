@@ -1,4 +1,6 @@
 import os
+import re
+import threading
 import cv2
 
 
@@ -20,7 +22,9 @@ class CropMemory:
 
     def __init__(self, root_dir="data/outputs", faces_subdir="crops/faces",
                  vehicles_subdir="crops/vehicles", plates_subdir="crops/plates",
-                 plate_model=None, plate_conf_thresh=0.40, plate_min_aspect=1.5):
+                 plate_model=None, plate_conf_thresh=0.40, plate_min_aspect=1.5,
+                 ocr_reader=None, ocr_conf_thresh=0.35,
+                 target_plates=None, telegram_token=None, telegram_chat_id=None):
         """Initialize the crop memory store.
 
         Args:
@@ -37,6 +41,14 @@ class CropMemory:
                 heuristic is used instead.
             plate_conf_thresh: Minimum confidence for plate detections.
             plate_min_aspect: Minimum width/height ratio for plate boxes.
+            ocr_reader: Optional OCR reader instance exposing an
+                easyocr-style ``readtext`` API. When None, easyocr is
+                auto-initialized on first use with a pytesseract fallback.
+            ocr_conf_thresh: Minimum easyocr confidence for plate text.
+            target_plates: Optional iterable of hotlist license plate
+                strings (case and separator insensitive) to alert on.
+            telegram_token: Telegram Bot Token used for hotlist alerts.
+            telegram_chat_id: Telegram target Chat ID for hotlist alerts.
         """
         self.root_dir = root_dir
         self.faces_dir = os.path.join(root_dir, faces_subdir)
@@ -52,6 +64,31 @@ class CropMemory:
         self.plate_min_aspect = plate_min_aspect
         self._plate_best_conf = {}
         self.plate_model = self._load_plate_model(plate_model)
+        self.ocr_reader = ocr_reader
+        self.ocr_conf_thresh = ocr_conf_thresh
+        self._ocr_backend = None
+        self._plate_texts = {}
+        self.target_plates = set()
+        if target_plates:
+            for target in target_plates:
+                cleaned = self._clean_plate_text(target)
+                if cleaned:
+                    self.target_plates.add(cleaned)
+        self.telegram_token = telegram_token
+        self.telegram_chat_id = telegram_chat_id
+        self.telegram_enabled = bool(telegram_token and telegram_chat_id)
+        self._hotlist_matched_ids = set()
+        self._http_requests = None
+        self._http_urllib3 = None
+        try:
+            import requests
+            self._http_requests = requests
+        except ImportError:
+            try:
+                import urllib3
+                self._http_urllib3 = urllib3
+            except ImportError:
+                pass
 
     @staticmethod
     def _load_plate_model(plate_model):
@@ -78,6 +115,196 @@ class CropMemory:
             return plate_model
         except Exception:
             return None
+
+    def _get_ocr_backend(self):
+        """Resolve the OCR backend, initializing it lazily on first use.
+
+        An explicitly provided reader instance (``ocr_reader``) is used
+        as-is. Otherwise easyocr is attempted first, then the lightweight
+        pytesseract fallback, and finally OCR is disabled. Load failures
+        never raise — the pipeline degrades to ``plate_text`` = None.
+
+        Returns:
+            Backend name ('easyocr', 'pytesseract') or 'disabled'.
+        """
+        if self._ocr_backend is not None:
+            return self._ocr_backend
+        if self.ocr_reader is not None:
+            self._ocr_backend = 'easyocr'
+            return self._ocr_backend
+        try:
+            from easyocr import Reader
+            self.ocr_reader = Reader(['en'], verbose=False)
+            self._ocr_backend = 'easyocr'
+        except Exception:
+            self.ocr_reader = None
+            try:
+                import pytesseract  # noqa: F401
+                self._ocr_backend = 'pytesseract'
+            except Exception:
+                self._ocr_backend = 'disabled'
+        return self._ocr_backend
+
+    @staticmethod
+    def _clean_plate_text(text):
+        """Normalize OCR output to an uppercase alphanumeric string.
+
+        Strips all non-alphanumeric characters (spaces, dashes, dots,
+        symbols). Returns None when the cleaned string is empty.
+
+        Args:
+            text: Raw OCR output string.
+
+        Returns:
+            Uppercase alphanumeric plate text, or None when empty.
+        """
+        if not text:
+            return None
+        cleaned = re.sub(r'[^A-Za-z0-9]', '', text).upper()
+        return cleaned if cleaned else None
+
+    def read_plate_text(self, plate_crop):
+        """Recognize and clean text from a plate crop image.
+
+        Uses the easyocr reader when available, otherwise the lightweight
+        pytesseract fallback. For easyocr, only the highest-confidence
+        recognition is kept and gated by ``ocr_conf_thresh``; low
+        confidence or any OCR failure yields None.
+
+        Args:
+            plate_crop: Cropped plate image (BGR array).
+
+        Returns:
+            Cleaned uppercase alphanumeric plate text, or None.
+        """
+        backend = self._get_ocr_backend()
+        if backend == 'disabled':
+            return None
+        try:
+            if backend == 'easyocr':
+                results = self.ocr_reader.readtext(plate_crop)
+                if not results:
+                    return None
+                best = max(results, key=lambda r: r[2])
+                if best[2] < self.ocr_conf_thresh:
+                    return None
+                text = best[1]
+            else:
+                import pytesseract
+                text = pytesseract.image_to_string(plate_crop, config='--psm 7')
+        except Exception:
+            return None
+        return self._clean_plate_text(text)
+
+    def _store_plate_text(self, crop, track_id):
+        """Run OCR on a plate crop and record the text for the track.
+
+        The recorded value is the cleaned plate text, or None when OCR
+        is unavailable or fails for this crop.
+
+        Returns:
+            The recorded (cleaned) plate text, or None.
+        """
+        text = self.read_plate_text(crop)
+        self._plate_texts[track_id] = text
+        return text
+
+    def get_plate_text(self, track_id):
+        """Return the last recognized plate text for a vehicle track.
+
+        Args:
+            track_id: Unique tracking identifier of the vehicle.
+
+        Returns:
+            Cleaned plate text, or None when OCR is unavailable, failed,
+            or no plate has been recognized for this track.
+        """
+        return self._plate_texts.get(track_id)
+
+    def is_hotlist_match(self, track_id):
+        """Whether a vehicle track has matched a hotlist plate.
+
+        Args:
+            track_id: Unique tracking identifier of the vehicle.
+
+        Returns:
+            True once a target plate has been recognized for the track.
+        """
+        return track_id in self._hotlist_matched_ids
+
+    def _is_hotlist_match(self, plate_text):
+        """Check a cleaned plate text against the hotlist targets.
+
+        Substring semantics are used so partial or noisy OCR output still
+        matches (e.g., target '1234' matches text 'ABC1234').
+        """
+        if not plate_text:
+            return False
+        return any(target in plate_text for target in self.target_plates)
+
+    def _check_hotlist(self, plate_text, track_id, image_path):
+        """Trigger the once-per-track alert for hotlist plate matches.
+
+        Marks the track as matched (driving visualizer highlighting and
+        telemetry) and dispatches the Telegram alert on the first match
+        for that track only.
+        """
+        if plate_text is None or track_id in self._hotlist_matched_ids:
+            return
+        if self._is_hotlist_match(plate_text):
+            self._hotlist_matched_ids.add(track_id)
+            self._send_telegram_alert(image_path, plate_text, track_id)
+
+    def _send_telegram_alert(self, image_path, plate_text, track_id):
+        """Dispatch a hotlist alert to Telegram without blocking the pipeline.
+
+        Sends the incident plate image with an HTML-formatted caption to
+        the configured chat via the sendPhoto API. Runs in a daemon
+        thread; failures (network drop, invalid token, missing image)
+        print a warning and never interrupt video processing.
+
+        Args:
+            image_path: Absolute path of the plate crop image to attach.
+            plate_text: Recognized hotlist plate text.
+            track_id: Unique tracking identifier of the matched vehicle.
+        """
+        if not self.telegram_enabled or not image_path or not os.path.isfile(image_path):
+            return
+        threading.Thread(target=self._telegram_alert_worker,
+                         args=(image_path, plate_text, track_id),
+                         daemon=True).start()
+
+    def _telegram_alert_worker(self, image_path, plate_text, track_id):
+        """Worker body for the Telegram alert (runs in a daemon thread).
+
+        Attaches the plate crop image to a sendPhoto request with the
+        hotlist message caption; any failure is reported and swallowed.
+        """
+        try:
+            url = f"https://api.telegram.org/bot{self.telegram_token}/sendPhoto"
+            caption = (
+                "🚨 <b>HOTLIST TARGET DETECTED</b>\n"
+                f"<b>Plate:</b> <code>{plate_text}</code>\n"
+                f"<b>Track ID:</b> #{track_id}"
+            )
+            with open(image_path, 'rb') as image_file:
+                if self._http_requests is not None:
+                    self._http_requests.post(
+                        url,
+                        data={'chat_id': self.telegram_chat_id,
+                              'caption': caption, 'parse_mode': 'HTML'},
+                        files={'photo': image_file}, timeout=10)
+                elif self._http_urllib3 is not None:
+                    self._http_urllib3.request(
+                        'POST', url,
+                        fields={'chat_id': self.telegram_chat_id,
+                                'caption': caption, 'parse_mode': 'HTML',
+                                'photo': (os.path.basename(image_path),
+                                          image_file.read(), 'image/jpeg')})
+                else:
+                    print("[-] Telegram alert skipped: no HTTP client available")
+        except Exception as exc:
+            print(f"[-] Telegram alert failed (track #{track_id}): {exc}")
 
     def compute_head_region(self, bbox, head_fraction=0.40, width_expansion=0.15):
         """Compute the head/shoulder region of a pedestrian bounding box.
@@ -304,8 +531,15 @@ class CropMemory:
             return None
         region = self.compute_plate_region(bbox, bottom_fraction, center_fraction)
         filename = f"plate_{track_id}.jpg"
-        return self._save_crop_once(frame, region, self.plates_dir, filename,
+        path = self._save_crop_once(frame, region, self.plates_dir, filename,
                                     track_id, self._saved_plate_ids)
+        if path is not None:
+            crop = self._extract_crop(frame, region)
+            if crop is not None:
+                text = self._store_plate_text(crop, track_id)
+                self._check_hotlist(text, track_id,
+                                    os.path.join(self.plates_dir, filename))
+        return path
 
     def _save_detected_plate(self, frame, bbox, track_id):
         """Run the two-stage plate detection pipeline for a vehicle.
@@ -315,7 +549,9 @@ class CropMemory:
         aspect ratio (width/height > ``plate_min_aspect``), maps the best
         detection from relative to frame coordinates, and persists the
         best plate crop seen so far for this ``track_id`` (overwriting
-        the file when a higher confidence detection arrives).
+        the file when a higher confidence detection arrives). OCR runs on
+        every newly accepted plate crop and the result is recorded per
+        track via ``_plate_texts``.
 
         Args:
             frame: Current video frame (BGR).
@@ -359,9 +595,12 @@ class CropMemory:
         if crop is None:
             return None
 
-        cv2.imwrite(os.path.join(self.plates_dir, filename), crop)
+        self._store_plate_text(crop, track_id)
+        abs_plate_path = os.path.join(self.plates_dir, filename)
+        cv2.imwrite(abs_plate_path, crop)
         self._plate_best_conf[track_id] = best_conf
         self._saved_plate_ids.add(track_id)
+        self._check_hotlist(self._plate_texts.get(track_id), track_id, abs_plate_path)
 
         rel_path = os.path.join(os.path.relpath(self.plates_dir, self.root_dir), filename)
         return rel_path
