@@ -53,6 +53,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description="CityAI - Urban Mobility Analytics")
     parser.add_argument("--source", type=str, default="0", help="Video path or webcam index (0)")
     parser.add_argument("--weights", type=str, default="yolov8x.pt", help="YOLO model path")
+    parser.add_argument("--plate-weights", type=str,
+                        default="models/keremberke_yolov8n-license-plate.pt",
+                        help="Secondary license plate YOLO weights (falls back to geometric heuristic if unavailable)")
     parser.add_argument("--conf", type=float, default=0.25, help="Confidence threshold")
     parser.add_argument("--iop-thresh", type=float, default=0.45, help="Feet IoP threshold for riders")
     parser.add_argument("--no-display", action="store_true", help="Disable GUI display window")
@@ -67,7 +70,10 @@ def main():
     
     detector = CityMobilityDetector(model_path=args.weights, conf_thresh=args.conf, iop_thresh=args.iop_thresh)
     visualizer = Visualizer()
-    memory = CropMemory()
+    memory = CropMemory(plate_model=args.plate_weights)
+    if memory.plate_model is None:
+        print(f"[-] Plate model '{args.plate_weights}' unavailable; "
+              f"falling back to geometric plate heuristic")
     
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():

@@ -11,14 +11,16 @@ class CropMemory:
     subsequent frames are prevented by internal registries of already
     saved track ids. Face crops are derived from the top 40% of the
     pedestrian box (expanded 15% outward on each side) and are gated on
-    consecutive-frame track stability; plate crops come from the
-    bottom-center region of enclosed vehicles.
+    consecutive-frame track stability; plate crops come from a secondary
+    two-stage license plate model (with a geometric bottom-center
+    fallback when no plate model is available).
     """
 
     ENCLOSED_VEHICLE_CLASSES = ('car', 'bus', 'truck')
 
     def __init__(self, root_dir="data/outputs", faces_subdir="crops/faces",
-                 vehicles_subdir="crops/vehicles", plates_subdir="crops/plates"):
+                 vehicles_subdir="crops/vehicles", plates_subdir="crops/plates",
+                 plate_model=None, plate_conf_thresh=0.40, plate_min_aspect=1.5):
         """Initialize the crop memory store.
 
         Args:
@@ -29,6 +31,12 @@ class CropMemory:
                 vehicle crops are persisted.
             plates_subdir: Sub-path (relative to ``root_dir``) where
                 license plate region crops are persisted.
+            plate_model: Optional secondary license plate YOLO model —
+                either a weights file path or an already-loaded YOLO
+                instance. When None or unloadable, the geometric plate
+                heuristic is used instead.
+            plate_conf_thresh: Minimum confidence for plate detections.
+            plate_min_aspect: Minimum width/height ratio for plate boxes.
         """
         self.root_dir = root_dir
         self.faces_dir = os.path.join(root_dir, faces_subdir)
@@ -40,6 +48,36 @@ class CropMemory:
         self._saved_vehicle_ids = set()
         self._saved_plate_ids = set()
         self._face_frame_counts = {}
+        self.plate_conf_thresh = plate_conf_thresh
+        self.plate_min_aspect = plate_min_aspect
+        self._plate_best_conf = {}
+        self.plate_model = self._load_plate_model(plate_model)
+
+    @staticmethod
+    def _load_plate_model(plate_model):
+        """Load the secondary license plate detection model.
+
+        Accepts a weights file path or an already-loaded YOLO instance.
+        Returns None when nothing is provided or loading fails, enabling
+        the caller to fall back gracefully to the geometric heuristic.
+
+        Args:
+            plate_model: Weights path or YOLO instance, or None.
+
+        Returns:
+            Loaded YOLO model, or None when unavailable.
+        """
+        if plate_model is None:
+            return None
+        try:
+            if isinstance(plate_model, str):
+                if not os.path.isfile(plate_model):
+                    return None
+                from ultralytics import YOLO
+                return YOLO(plate_model)
+            return plate_model
+        except Exception:
+            return None
 
     def compute_head_region(self, bbox, head_fraction=0.40, width_expansion=0.15):
         """Compute the head/shoulder region of a pedestrian bounding box.
@@ -104,6 +142,21 @@ class CropMemory:
         return (max(0, int(x1)), max(0, int(y1)),
                 min(w, int(x2)), min(h, int(y2)))
 
+    def _extract_crop(self, frame, region):
+        """Extract a clamped crop region from the frame.
+
+        Args:
+            frame: Current video frame (BGR).
+            region: (x1, y1, x2, y2) crop region.
+
+        Returns:
+            Crop image array, or None when the region is degenerate.
+        """
+        cx1, cy1, cx2, cy2 = self._clamp_region(region, frame.shape)
+        if cx2 <= cx1 or cy2 <= cy1:
+            return None
+        return frame[cy1:cy2, cx1:cx2]
+
     def _save_crop_once(self, frame, region, directory, filename,
                         track_id, saved_ids):
         """Persist a single crop region, exactly once per track id.
@@ -123,13 +176,11 @@ class CropMemory:
         if track_id is None or track_id in saved_ids:
             return None
 
-        cx1, cy1, cx2, cy2 = self._clamp_region(region, frame.shape)
-        if cx2 <= cx1 or cy2 <= cy1:
+        crop = self._extract_crop(frame, region)
+        if crop is None:
             return None
 
-        crop = frame[cy1:cy2, cx1:cx2]
-        abs_path = os.path.join(directory, filename)
-        cv2.imwrite(abs_path, crop)
+        cv2.imwrite(os.path.join(directory, filename), crop)
         saved_ids.add(track_id)
 
         rel_path = os.path.join(os.path.relpath(directory, self.root_dir), filename)
@@ -211,7 +262,14 @@ class CropMemory:
 
     def save_plate_crop(self, frame, bbox, track_id, vehicle_class=None,
                         bottom_fraction=0.35, center_fraction=0.60):
-        """Save the license plate region for a unique vehicle, exactly once.
+        """Save the license plate crop for a unique vehicle, exactly once.
+
+        When a secondary license plate model is loaded, runs the
+        two-stage pipeline: the vehicle is cropped from the frame, the
+        plate model runs on that crop only, and the best quality-gated
+        detection is mapped back to frame coordinates and persisted.
+        When no plate model is available, falls back gracefully to the
+        geometric bottom-center heuristic.
 
         Only enclosed vehicle classes (car, bus, truck) are eligible for
         plate regions; open micro-mobility classes return None immediately.
@@ -222,21 +280,91 @@ class CropMemory:
             track_id: Unique tracking identifier of the vehicle.
             vehicle_class: Detected vehicle class (validated against
                 ``ENCLOSED_VEHICLE_CLASSES``).
-            bottom_fraction: Fraction of the box height taken from the bottom.
-            center_fraction: Fraction of the box width kept around the center.
+            bottom_fraction: Fraction of the box height taken from the
+                bottom (geometric fallback only).
+            center_fraction: Fraction of the box width kept around the
+                center (geometric fallback only).
 
         Returns:
-            Crop path (relative to ``root_dir``) when the crop was saved
-            for this ``track_id`` for the first time, otherwise None.
+            Crop path (relative to ``root_dir``) when a plate crop was
+            saved or improved for this ``track_id``, otherwise None.
         """
         if vehicle_class is not None and vehicle_class not in self.ENCLOSED_VEHICLE_CLASSES:
             return None
-        if track_id is None or track_id in self._saved_plate_ids:
+        if track_id is None:
+            return None
+
+        if self.plate_model is not None:
+            try:
+                return self._save_detected_plate(frame, bbox, track_id)
+            except Exception:
+                return None
+
+        if track_id in self._saved_plate_ids:
             return None
         region = self.compute_plate_region(bbox, bottom_fraction, center_fraction)
         filename = f"plate_{track_id}.jpg"
         return self._save_crop_once(frame, region, self.plates_dir, filename,
                                     track_id, self._saved_plate_ids)
+
+    def _save_detected_plate(self, frame, bbox, track_id):
+        """Run the two-stage plate detection pipeline for a vehicle.
+
+        Extracts the vehicle crop, runs the secondary plate model on it,
+        filters detections by confidence (> ``plate_conf_thresh``) and
+        aspect ratio (width/height > ``plate_min_aspect``), maps the best
+        detection from relative to frame coordinates, and persists the
+        best plate crop seen so far for this ``track_id`` (overwriting
+        the file when a higher confidence detection arrives).
+
+        Args:
+            frame: Current video frame (BGR).
+            bbox: (x1, y1, x2, y2) vehicle bounding box.
+            track_id: Unique tracking identifier of the vehicle.
+
+        Returns:
+            Crop path (relative to ``root_dir``) when a plate crop was
+            saved or improved for this ``track_id``, otherwise None.
+        """
+        vx1, vy1, vx2, vy2 = self._clamp_region(bbox, frame.shape)
+        if vx2 <= vx1 or vy2 <= vy1:
+            return None
+
+        vehicle_crop = frame[vy1:vy2, vx1:vx2]
+        results = self.plate_model(vehicle_crop, conf=self.plate_conf_thresh,
+                                   verbose=False)[0]
+
+        best_conf, best_rel = 0.0, None
+        if results.boxes is not None:
+            for box in results.boxes:
+                rx1, ry1, rx2, ry2 = box.xyxy[0].cpu().numpy().tolist()
+                conf = float(box.conf[0].item())
+                plate_w = rx2 - rx1
+                plate_h = ry2 - ry1
+                if plate_h <= 0 or (plate_w / plate_h) <= self.plate_min_aspect:
+                    continue
+                if conf <= self.plate_conf_thresh or conf <= best_conf:
+                    continue
+                best_conf, best_rel = conf, (rx1, ry1, rx2, ry2)
+
+        if best_rel is None:
+            return None
+        if self._plate_best_conf.get(track_id, 0.0) >= best_conf:
+            return None
+
+        rx1, ry1, rx2, ry2 = best_rel
+        frame_region = (rx1 + vx1, ry1 + vy1, rx2 + vx1, ry2 + vy1)
+        filename = f"plate_{track_id}.jpg"
+        crop = self._extract_crop(frame, frame_region)
+        if crop is None:
+            return None
+
+        cv2.imwrite(os.path.join(self.plates_dir, filename), crop)
+        self._plate_best_conf[track_id] = best_conf
+        self._saved_plate_ids.add(track_id)
+
+        rel_path = os.path.join(os.path.relpath(self.plates_dir, self.root_dir), filename)
+        return rel_path
 
     def summary(self):
         """Report crop memory statistics.
