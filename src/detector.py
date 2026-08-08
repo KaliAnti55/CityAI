@@ -2,7 +2,14 @@ import numpy as np
 from ultralytics import YOLO
 
 class CityDetector:
-    def __init__(self, model_path="yolov8x.pt", conf_thresh=0.25, iop_thresh=0.45):
+    """Detection, tracking and micro-mobility association engine.
+
+    Runs YOLOv8x inference with online multi-object tracking (ByteTrack
+    via ``model.track``) so every object receives a persistent ``track_id``
+    across frames. Preserves the feet-anchored IoP rider association logic.
+    """
+
+    def __init__(self, model_path="yolov8x.pt", conf_thresh=0.25, iop_thresh=0.45, use_tracking=True):
         # Accept either a loaded YOLO object or a string file path
         if isinstance(model_path, str):
             self.model = YOLO(model_path)
@@ -11,6 +18,7 @@ class CityDetector:
             
         self.conf_thresh = conf_thresh
         self.iop_thresh = iop_thresh
+        self.use_tracking = use_tracking
         
         # Micro-mobility classes that allow active riders
         self.rider_vehicle_classes = ['bicycle', 'motorcycle']
@@ -51,8 +59,44 @@ class CityDetector:
             
         return intersection / feet_area
 
+    def _run_inference(self, frame):
+        """Run YOLO inference, enabling online tracking when configured.
+
+        Uses ``model.track`` (ByteTrack) with ``persist=True`` so track
+        identities are carried across frames. Falls back to plain
+        detection if the tracker is unavailable in the current runtime.
+
+        Returns:
+            Ultralytics result object for the current frame.
+        """
+        if self.use_tracking:
+            try:
+                return self.model.track(frame, conf=self.conf_thresh,
+                                        persist=True, verbose=False)[0]
+            except Exception:
+                pass
+        return self.model(frame, conf=self.conf_thresh, verbose=False)[0]
+
+    @staticmethod
+    def _extract_track_id(box):
+        """Extract the unique track id attached to a detection box.
+
+        Args:
+            box: Ultralytics box object (may or may not carry an id).
+
+        Returns:
+            Integer track id when tracking is active, else None.
+        """
+        try:
+            track_id = box.id
+            if track_id is not None:
+                return int(track_id[0].item())
+        except (AttributeError, IndexError, TypeError, ValueError):
+            pass
+        return None
+
     def process_frame(self, frame):
-        results = self.model(frame, conf=self.conf_thresh, verbose=False)[0]
+        results = self._run_inference(frame)
         
         pedestrians = []
         rider_eligible_vehicles = []
@@ -73,6 +117,10 @@ class CityDetector:
                     'confidence': round(conf, 2),
                     'class': label
                 }
+
+                track_id = self._extract_track_id(box)
+                if track_id is not None:
+                    item['track_id'] = track_id
                 
                 if label == 'person':
                     pedestrians.append(item)

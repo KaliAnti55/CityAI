@@ -4,6 +4,44 @@ import json
 import cv2
 from src.detector import CityMobilityDetector
 from src.visualizer import Visualizer
+from src.memory import CropMemory
+
+def record_face_crops(frame, telemetry, memory):
+    """Persist face crops for newly tracked pedestrians and annotate telemetry.
+
+    For every person (standalone pedestrian or active rider) carrying a
+    ``track_id``, requests a one-time face crop save from ``memory`` and,
+    on first save, attaches the resulting crop path to the telemetry entry.
+    """
+    persons = telemetry.get('pedestrians', []) + telemetry.get('active_riders', [])
+    for person in persons:
+        track_id = person.get('track_id')
+        if track_id is None:
+            continue
+        crop_path = memory.save_face_crop(frame, person['bbox'], track_id)
+        if crop_path is not None:
+            person['face_crop_path'] = crop_path
+
+def record_vehicle_crops(frame, telemetry, memory):
+    """Persist vehicle and license plate crops for newly tracked vehicles.
+
+    A full vehicle crop is saved once per unique ``track_id``; for enclosed
+    vehicle classes (car, bus, truck) a license plate region crop is saved
+    alongside it. Crop paths are attached to the vehicle telemetry entries
+    on first save.
+    """
+    for vehicle in telemetry.get('vehicles', []):
+        track_id = vehicle.get('track_id')
+        if track_id is None:
+            continue
+        vehicle_class = vehicle['class']
+        crop_path = memory.save_vehicle_crop(frame, vehicle['bbox'], track_id, vehicle_class)
+        if crop_path is not None:
+            vehicle['vehicle_crop_path'] = crop_path
+        if vehicle_class in memory.ENCLOSED_VEHICLE_CLASSES:
+            plate_path = memory.save_plate_crop(frame, vehicle['bbox'], track_id, vehicle_class)
+            if plate_path is not None:
+                vehicle['plate_crop_path'] = plate_path
 
 def parse_args():
     parser = argparse.ArgumentParser(description="CityAI - Urban Mobility Analytics")
@@ -23,6 +61,7 @@ def main():
     
     detector = CityMobilityDetector(model_path=args.weights, conf_thresh=args.conf, iop_thresh=args.iop_thresh)
     visualizer = Visualizer()
+    memory = CropMemory()
     
     cap = cv2.VideoCapture(source)
     if not cap.isOpened():
@@ -50,6 +89,8 @@ def main():
             
         frame_count += 1
         telemetry = detector.process_frame(frame)
+        record_face_crops(frame, telemetry, memory)
+        record_vehicle_crops(frame, telemetry, memory)
         last_telemetry = telemetry
         
         annotated_frame = visualizer.draw(frame, telemetry)
@@ -70,6 +111,13 @@ def main():
     cv2.destroyAllWindows()
     
     print(f"[+] Processed video saved to: {out_video_path}")
+    memory_stats = memory.summary()
+    print(f"[+] Unique face crops saved: {memory_stats['unique_faces_saved']} "
+          f"-> {memory_stats['faces_dir']}")
+    print(f"[+] Unique vehicle crops saved: {memory_stats['unique_vehicles_saved']} "
+          f"-> {memory_stats['vehicles_dir']}")
+    print(f"[+] Unique plate crops saved: {memory_stats['unique_plates_saved']} "
+          f"-> {memory_stats['plates_dir']}")
     
     if args.save_json and last_telemetry is not None:
         json_path = "data/outputs/output.json"

@@ -17,7 +17,9 @@ class Visualizer:
         for ped in telemetry.get('pedestrians', []):
             x1, y1, x2, y2 = map(int, ped['bbox'])
             cv2.rectangle(img, (x1, y1), (x2, y2), self.COLOR_PEDESTRIAN, 2)
-            label = f"Pedestrian {ped['confidence']}"
+            track_id = ped.get('track_id')
+            label = (f"Ped #{track_id} {ped['confidence']}" if track_id is not None
+                     else f"Pedestrian {ped['confidence']}")
             cv2.putText(img, label, (x1, max(y1 - 6, 15)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, self.COLOR_PEDESTRIAN, 1)
 
@@ -25,7 +27,10 @@ class Visualizer:
         for veh in telemetry.get('vehicles', []):
             x1, y1, x2, y2 = map(int, veh['bbox'])
             cv2.rectangle(img, (x1, y1), (x2, y2), self.COLOR_VEHICLE, 2)
-            label = f"{veh['class'].upper()} {veh['confidence']}"
+            track_id = veh.get('track_id')
+            label = (f"{veh['class'].upper()} #{track_id} {veh['confidence']}"
+                     if track_id is not None
+                     else f"{veh['class'].upper()} {veh['confidence']}")
             cv2.putText(img, label, (x1, max(y1 - 6, 15)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, self.COLOR_VEHICLE, 1)
 
@@ -35,6 +40,9 @@ class Visualizer:
             cv2.rectangle(img, (px1, py1), (px2, py2), self.COLOR_RIDER, 2)
             
             label = f"Rider ({rider['rider_of']}) IoP:{rider['iop']}"
+            track_id = rider.get('track_id')
+            if track_id is not None:
+                label = f"Rider #{track_id} ({rider['rider_of']}) IoP:{rider['iop']}"
             cv2.putText(img, label, (px1, max(py1 - 6, 15)),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, self.COLOR_RIDER, 1)
             
