@@ -71,6 +71,8 @@ def parse_args():
                         help="Telegram target Chat ID for hotlist plate alerts")
     parser.add_argument("--target-plates", type=str, default=None,
                         help="Comma-separated hotlist license plates (e.g., \"ABC1234,XYZ789,1234\")")
+    parser.add_argument("--gemini-api-key", type=str, default=None,
+                        help="Google Gemini API key for Vision OCR of license plates")
     return parser.parse_args()
 
 def main():
@@ -86,12 +88,15 @@ def main():
         target_plates = {p.strip() for p in args.target_plates.split(',') if p.strip()}
     memory = CropMemory(plate_model=args.plate_weights, target_plates=target_plates,
                         telegram_token=args.telegram_token,
-                        telegram_chat_id=args.telegram_chat_id)
+                        telegram_chat_id=args.telegram_chat_id,
+                        gemini_api_key=args.gemini_api_key)
     if memory.plate_model is None:
         print(f"[-] Plate model '{args.plate_weights}' unavailable; "
               f"falling back to geometric plate heuristic")
     if memory.target_plates:
         print(f"[*] Hotlist plates loaded: {', '.join(sorted(memory.target_plates))}")
+    if args.gemini_api_key:
+        print("[+] Gemini Vision API OCR enabled (falls back to local OCR on API failure)")
     if args.telegram_token or args.telegram_chat_id:
         if memory.telegram_enabled:
             print("[+] Telegram hotlist alerts enabled")

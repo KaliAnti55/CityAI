@@ -24,7 +24,8 @@ class CropMemory:
                  vehicles_subdir="crops/vehicles", plates_subdir="crops/plates",
                  plate_model=None, plate_conf_thresh=0.40, plate_min_aspect=1.5,
                  ocr_reader=None, ocr_conf_thresh=0.35,
-                 target_plates=None, telegram_token=None, telegram_chat_id=None):
+                 target_plates=None, telegram_token=None, telegram_chat_id=None,
+                 gemini_api_key=None):
         """Initialize the crop memory store.
 
         Args:
@@ -49,6 +50,10 @@ class CropMemory:
                 strings (case and separator insensitive) to alert on.
             telegram_token: Telegram Bot Token used for hotlist alerts.
             telegram_chat_id: Telegram target Chat ID for hotlist alerts.
+            gemini_api_key: Optional Google Gemini API key enabling
+                Gemini Vision API OCR for plate text (falls back to the
+                local OCR backend when the API call fails or no key is
+                provided).
         """
         self.root_dir = root_dir
         self.faces_dir = os.path.join(root_dir, faces_subdir)
@@ -68,6 +73,7 @@ class CropMemory:
         self.ocr_conf_thresh = ocr_conf_thresh
         self._ocr_backend = None
         self._plate_texts = {}
+        self.gemini_api_key = gemini_api_key
         self.target_plates = set()
         if target_plates:
             for target in target_plates:
@@ -163,26 +169,80 @@ class CropMemory:
         cleaned = re.sub(r'[^A-Za-z0-9]', '', text).upper()
         return cleaned if cleaned else None
 
-    def read_plate_text(self, plate_crop):
-        """Recognize and clean text from a plate crop image.
+    @staticmethod
+    def _ocr_with_gemini(crop_path, api_key):
+        """Run Gemini Vision API OCR on a saved plate crop image.
 
-        Uses the easyocr reader when available, otherwise the lightweight
-        pytesseract fallback. For easyocr, only the highest-confidence
-        recognition is kept and gated by ``ocr_conf_thresh``; low
-        confidence or any OCR failure yields None.
+        Sends the image to the ``gemini-3.5-flash-lite`` model via the REST
+        generateContent endpoint using a strict plate-extraction prompt.
+        Any API failure (network drop, bad key, quota) returns None so
+        the caller can fall back to the local OCR backend.
 
         Args:
-            plate_crop: Cropped plate image (BGR array).
+            crop_path: Path of the saved plate crop image.
+            api_key: Google Gemini API key.
+
+        Returns:
+            Raw extracted text, or None on failure.
+        """
+        try:
+            import base64
+            import requests
+            with open(crop_path, 'rb') as image_file:
+                image_b64 = base64.b64encode(image_file.read()).decode('ascii')
+            mime_type = 'image/png' if str(crop_path).lower().endswith('.png') else 'image/jpeg'
+            url = ("https://generativelanguage.googleapis.com/v1beta/models/"
+                   f"gemini-3.5-flash-lite:generateContent?key={api_key}")
+            prompt = ("Extract ONLY the license plate alphanumeric characters "
+                      "from this image. Return just the uppercase characters "
+                      "without spaces, punctuation, or extra words.")
+            payload = {
+                "contents": [{
+                    "parts": [
+                        {"inline_data": {"mime_type": mime_type, "data": image_b64}},
+                        {"text": prompt}
+                    ]
+                }]
+            }
+            response = requests.post(url, json=payload, timeout=20)
+            response.raise_for_status()
+            data = response.json()
+            candidates = data.get('candidates') or []
+            if not candidates:
+                return None
+            parts = candidates[0].get('content', {}).get('parts') or []
+            if not parts:
+                return None
+            return parts[0].get('text')
+        except Exception:
+            return None
+
+    def read_plate_text(self, plate_image):
+        """Recognize and clean text from a plate crop image or path.
+
+        Prefers the Gemini Vision API when a ``gemini_api_key`` is
+        configured (falling back to the local OCR backend if the API
+        call fails). Without a key, uses easyocr, then the lightweight
+        pytesseract fallback. For easyocr, only the highest-confidence
+        recognition is kept and gated by ``ocr_conf_thresh``; any OCR
+        failure yields None.
+
+        Args:
+            plate_image: Plate crop image (BGR array) or saved file path.
 
         Returns:
             Cleaned uppercase alphanumeric plate text, or None.
         """
+        if self.gemini_api_key and isinstance(plate_image, str) and os.path.isfile(plate_image):
+            text = self._ocr_with_gemini(plate_image, self.gemini_api_key)
+            if text is not None:
+                return self._clean_plate_text(text)
         backend = self._get_ocr_backend()
         if backend == 'disabled':
             return None
         try:
             if backend == 'easyocr':
-                results = self.ocr_reader.readtext(plate_crop)
+                results = self.ocr_reader.readtext(plate_image)
                 if not results:
                     return None
                 best = max(results, key=lambda r: r[2])
@@ -191,21 +251,27 @@ class CropMemory:
                 text = best[1]
             else:
                 import pytesseract
-                text = pytesseract.image_to_string(plate_crop, config='--psm 7')
+                text = pytesseract.image_to_string(plate_image, config='--psm 7')
         except Exception:
             return None
         return self._clean_plate_text(text)
 
-    def _store_plate_text(self, crop, track_id):
-        """Run OCR on a plate crop and record the text for the track.
+    def _store_plate_text(self, crop_path, track_id):
+        """Run OCR on a saved plate crop and record the text for the track.
 
-        The recorded value is the cleaned plate text, or None when OCR
-        is unavailable or fails for this crop.
+        Uses the Gemini Vision API when a key is configured (falling back
+        to the local OCR backend on failure); otherwise the local backend
+        directly. The recorded value is the cleaned plate text, or None
+        when OCR is unavailable or fails for this crop.
+
+        Args:
+            crop_path: Path of the saved plate crop image.
+            track_id: Unique tracking identifier of the vehicle.
 
         Returns:
             The recorded (cleaned) plate text, or None.
         """
-        text = self.read_plate_text(crop)
+        text = self.read_plate_text(crop_path)
         self._plate_texts[track_id] = text
         return text
 
@@ -534,11 +600,9 @@ class CropMemory:
         path = self._save_crop_once(frame, region, self.plates_dir, filename,
                                     track_id, self._saved_plate_ids)
         if path is not None:
-            crop = self._extract_crop(frame, region)
-            if crop is not None:
-                text = self._store_plate_text(crop, track_id)
-                self._check_hotlist(text, track_id,
-                                    os.path.join(self.plates_dir, filename))
+            abs_plate_path = os.path.join(self.plates_dir, filename)
+            text = self._store_plate_text(abs_plate_path, track_id)
+            self._check_hotlist(text, track_id, abs_plate_path)
         return path
 
     def _save_detected_plate(self, frame, bbox, track_id):
@@ -595,12 +659,12 @@ class CropMemory:
         if crop is None:
             return None
 
-        self._store_plate_text(crop, track_id)
         abs_plate_path = os.path.join(self.plates_dir, filename)
         cv2.imwrite(abs_plate_path, crop)
         self._plate_best_conf[track_id] = best_conf
         self._saved_plate_ids.add(track_id)
-        self._check_hotlist(self._plate_texts.get(track_id), track_id, abs_plate_path)
+        text = self._store_plate_text(abs_plate_path, track_id)
+        self._check_hotlist(text, track_id, abs_plate_path)
 
         rel_path = os.path.join(os.path.relpath(self.plates_dir, self.root_dir), filename)
         return rel_path
