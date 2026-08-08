@@ -9,9 +9,10 @@ class CropMemory:
     identified by a persistent ``track_id`` is extracted from the frame
     and persisted to disk exactly once — duplicate saves across
     subsequent frames are prevented by internal registries of already
-    saved track ids. Face crops are derived from the top 30% of the
-    pedestrian box; plate crops from the bottom-center region of enclosed
-    vehicles.
+    saved track ids. Face crops are derived from the top 40% of the
+    pedestrian box (expanded 15% outward on each side) and are gated on
+    consecutive-frame track stability; plate crops come from the
+    bottom-center region of enclosed vehicles.
     """
 
     ENCLOSED_VEHICLE_CLASSES = ('car', 'bus', 'truck')
@@ -38,24 +39,31 @@ class CropMemory:
         self._saved_face_ids = set()
         self._saved_vehicle_ids = set()
         self._saved_plate_ids = set()
+        self._face_frame_counts = {}
 
-    def compute_head_region(self, bbox, head_fraction=0.30):
-        """Compute the head/facial region of a pedestrian bounding box.
+    def compute_head_region(self, bbox, head_fraction=0.40, width_expansion=0.15):
+        """Compute the head/shoulder region of a pedestrian bounding box.
 
-        The region spans the full box width and the top ``head_fraction``
-        of the box height (the default top 30% targets the face area).
+        The region spans the box width expanded outward by
+        ``width_expansion`` (15% per side by default) and the top
+        ``head_fraction`` of the box height (default top 40% captures the
+        full facial geometry including chin and mouth). Out-of-frame
+        expansion is clamped to the frame borders at save time.
 
         Args:
             bbox: (x1, y1, x2, y2) pedestrian bounding box.
             head_fraction: Fraction of the box height used for the crop.
+            width_expansion: Fraction of the box width added on each side.
 
         Returns:
             Tuple (x1, y1, x2, y2) describing the head region.
         """
         x1, y1, x2, y2 = bbox
+        width = x2 - x1
         height = y2 - y1
+        expand = width * width_expansion
         head_y2 = y1 + height * head_fraction
-        return (x1, y1, x2, head_y2)
+        return (x1 - expand, y1, x2 + expand, head_y2)
 
     def compute_plate_region(self, bbox, bottom_fraction=0.35, center_fraction=0.60):
         """Compute the license plate region of a vehicle bounding box.
@@ -127,14 +135,24 @@ class CropMemory:
         rel_path = os.path.join(os.path.relpath(directory, self.root_dir), filename)
         return rel_path
 
-    def save_face_crop(self, frame, bbox, track_id, head_fraction=0.30):
-        """Save the face/head crop for a unique pedestrian, exactly once.
+    def save_face_crop(self, frame, bbox, track_id, head_fraction=0.40,
+                       width_expansion=0.15, min_stable_frames=5):
+        """Save the face/head crop for a stable unique pedestrian, exactly once.
+
+        The crop is only triggered once the ``track_id`` has been observed
+        for at least ``min_stable_frames`` consecutive frames, so
+        detections early in a track (low confidence or unstable boxes)
+        never produce a crop. Each unique ``track_id`` is still saved
+        exactly once.
 
         Args:
             frame: Current video frame (BGR).
             bbox: (x1, y1, x2, y2) pedestrian bounding box.
             track_id: Unique tracking identifier of the pedestrian.
             head_fraction: Fraction of the box height used for the crop.
+            width_expansion: Fraction of the box width added on each side.
+            min_stable_frames: Minimum consecutive frames the track must
+                be observed for before the crop is saved.
 
         Returns:
             Crop path (relative to ``root_dir``) when the crop was saved
@@ -142,10 +160,34 @@ class CropMemory:
         """
         if track_id is None or track_id in self._saved_face_ids:
             return None
-        region = self.compute_head_region(bbox, head_fraction)
+
+        count = self._face_frame_counts.get(track_id, 0) + 1
+        self._face_frame_counts[track_id] = count
+        if count < min_stable_frames:
+            return None
+
+        region = self.compute_head_region(bbox, head_fraction, width_expansion)
         filename = f"pedestrian_{track_id}.jpg"
         return self._save_crop_once(frame, region, self.faces_dir, filename,
                                     track_id, self._saved_face_ids)
+
+    def mark_frame_observations(self, observed_track_ids):
+        """Reset consecutive observation streaks for absent face tracks.
+
+        Track ids present in the current frame keep their accumulated
+        streak (incremented by ``save_face_crop``); ids absent from the
+        current frame lose their streak entirely. This enforces strict
+        consecutive-frame stability semantics and guards against
+        ByteTrack id reuse for unrelated objects.
+
+        Args:
+            observed_track_ids: Iterable of person track ids detected in
+                the current frame.
+        """
+        observed = set(observed_track_ids)
+        for track_id in list(self._face_frame_counts.keys()):
+            if track_id not in observed:
+                del self._face_frame_counts[track_id]
 
     def save_vehicle_crop(self, frame, bbox, track_id, vehicle_class):
         """Save the full vehicle crop, exactly once per unique track id.

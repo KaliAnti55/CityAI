@@ -7,20 +7,26 @@ from src.visualizer import Visualizer
 from src.memory import CropMemory
 
 def record_face_crops(frame, telemetry, memory):
-    """Persist face crops for newly tracked pedestrians and annotate telemetry.
+    """Persist face crops for stable tracked pedestrians and annotate telemetry.
 
     For every person (standalone pedestrian or active rider) carrying a
-    ``track_id``, requests a one-time face crop save from ``memory`` and,
-    on first save, attaches the resulting crop path to the telemetry entry.
+    ``track_id``, requests a one-time face crop save from ``memory``
+    (which only fires after the track has been stable for consecutive
+    frames) and, on first save, attaches the resulting crop path to the
+    telemetry entry. Person track ids observed this frame are reported so
+    the memory module can reset streaks of tracks that disappeared.
     """
     persons = telemetry.get('pedestrians', []) + telemetry.get('active_riders', [])
+    person_ids = set()
     for person in persons:
         track_id = person.get('track_id')
         if track_id is None:
             continue
+        person_ids.add(track_id)
         crop_path = memory.save_face_crop(frame, person['bbox'], track_id)
         if crop_path is not None:
             person['face_crop_path'] = crop_path
+    memory.mark_frame_observations(person_ids)
 
 def record_vehicle_crops(frame, telemetry, memory):
     """Persist vehicle and license plate crops for newly tracked vehicles.
