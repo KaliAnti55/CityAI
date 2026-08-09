@@ -3,6 +3,7 @@ import re
 import threading
 import time
 from datetime import datetime
+import numpy as np
 import cv2
 
 
@@ -28,8 +29,8 @@ class CropMemory:
                  ocr_reader=None, ocr_conf_thresh=0.35,
                  target_plates=None, telegram_token=None, telegram_chat_id=None,
                  gemini_api_key=None, entry_line_y=0.5, crossing_cooldown_frames=30,
-                 loitering_threshold=10, face_min_ratio=0.5, face_max_ratio=2.0,
-                 face_sim_threshold=0.75):
+                 loitering_threshold=10, face_min_ratio=0.75, face_max_ratio=1.75,
+                 face_min_size=24, face_sim_threshold=0.75, face_match_distance=0.40):
         """Initialize the crop memory store.
 
         Args:
@@ -69,13 +70,21 @@ class CropMemory:
                 is recorded (default 10).
             face_min_ratio: Minimum height/width ratio of the face crop
                 region; distorted (chopped or heavily occluded) regions
-                below this ratio are rejected (default 0.5).
+                below this ratio are rejected immediately (default 0.75).
             face_max_ratio: Maximum height/width ratio of the face crop
                 region accepted before it is considered distorted
-                (default 2.0).
-            face_sim_threshold: HSV histogram correlation score above
-                which a face crop is considered the same physical person
-                as a stored employee crop (default 0.75).
+                (default 1.75).
+            face_min_size: Minimum width/height (pixels) of the face crop
+                region; smaller (truncated or too distant) crops are
+                discarded without saving (default 24).
+            face_sim_threshold: HSV histogram correlation fallback score
+                above which a face crop is considered the same physical
+                person when the DeepFace embedding backend is unavailable
+                (default 0.75).
+            face_match_distance: Cosine distance threshold for the DeepFace
+                embedding backend; a candidate crop within this distance of
+                a stored crop is matched to the same physical identity
+                (default 0.40).
         """
         self.root_dir = root_dir
         self.faces_dir = os.path.join(root_dir, faces_subdir)
@@ -112,7 +121,11 @@ class CropMemory:
         self._face_alias_map = {}
         self.face_min_ratio = face_min_ratio
         self.face_max_ratio = face_max_ratio
+        self.face_min_size = face_min_size
         self.face_sim_threshold = face_sim_threshold
+        self.face_match_distance = face_match_distance
+        self._deepface_available = None
+        self._embedding_cache = {}
         self._face_hist_cache = {}
         self._face_clarity_cache = {}
         self.target_plates = set()
@@ -839,13 +852,14 @@ class CropMemory:
         the frame borders. Crops failing this check are ignored for the
         frame and retried on subsequent frames.
 
-        When the crop passes, its **visual features** (HSV histogram
-        correlation) are compared against every stored employee crop in
-        ``data/outputs/crops/faces/``. If the best correlation exceeds
-        ``face_sim_threshold`` (0.75 by default), the current ``track_id``
-        is aliased to the stored identity: no new image is written, and if
-        the candidate is clearer than the stored image the stored file is
-        replaced (identity image is always the highest-clarity version).
+        When the crop passes, its **facial identity** is verified against
+        every stored employee crop in ``data/outputs/crops/faces/`` using
+        a DeepFace (FaceNet) 512-D embedding: the closest stored identity
+        with cosine distance < ``face_match_distance`` (0.40) is aliased —
+        no new image is written, and if the candidate is clearer than the
+        stored image the stored file is replaced (identity image is always
+        the highest-clarity version). When DeepFace is unavailable the
+        matcher gracefully falls back to HSV histogram correlation.
 
         Args:
             frame: Current video frame (BGR).
@@ -902,10 +916,12 @@ class CropMemory:
     def _face_geometry_ok(self, region, frame_shape):
         """Verify a head region contains a complete, unclipped face.
 
-        Rejects regions whose height/width ratio is distorted — typical of
-        chopped top-half / forehead-only detections or faces occluded by
-        desks/laptops — and regions that extend past the frame borders
-        (people cut off at the screen edge).
+        Strict geometry gate: the height/width ratio must sit inside
+        ``(face_min_ratio, face_max_ratio)`` (forehead-only or half-face
+        chopped crops have a distorted ratio and are discarded
+        immediately), both sides must be at least ``face_min_size`` pixels,
+        and the region must not extend past the frame borders (people cut
+        off at the screen edge).
 
         Args:
             region: (x1, y1, x2, y2) candidate face/head region.
@@ -918,7 +934,7 @@ class CropMemory:
         x1, y1, x2, y2 = region
         rw = x2 - x1
         rh = y2 - y1
-        if rw <= 0 or rh <= 0:
+        if rw < self.face_min_size or rh < self.face_min_size:
             return False
         ratio = rh / rw
         if ratio < self.face_min_ratio or ratio > self.face_max_ratio:
@@ -946,6 +962,9 @@ class CropMemory:
     @staticmethod
     def _face_histogram(crop):
         """Compute a normalized HSV (H+S) histogram feature vector.
+
+        Fallback visual feature used only when the DeepFace embedding
+        backend is unavailable.
 
         Returns:
             Normalized 2-D histogram, or None on invalid input.
@@ -975,6 +994,65 @@ class CropMemory:
         except cv2.error:
             return 0.0
 
+    @staticmethod
+    def _cosine_distance(a, b):
+        """Cosine distance between two normalized feature vectors.
+
+        Args:
+            a: Normalized embedding (numpy array).
+            b: Normalized embedding (numpy array).
+
+        Returns:
+            Cosine distance in ``[0, 2]``; identical vectors score 0.0.
+        """
+        return float(1.0 - float(np.dot(np.asarray(a, dtype=np.float64),
+                                        np.asarray(b, dtype=np.float64))))
+
+    @staticmethod
+    def _deepface_embedding(crop):
+        """Extract a normalized 512-D face embedding via DeepFace (FaceNet).
+
+        Uses ``DeepFace.represent`` with ``detector_backend='skip'`` and
+        ``enforce_detection=False`` because the input is already a head
+        crop, so no extra face-detector stage is needed.
+
+        Returns:
+            Normalized 512-D embedding array, or None when DeepFace is not
+            installed or the backend fails.
+        """
+        try:
+            from deepface import DeepFace
+            result = DeepFace.represent(
+                img_path=crop, model_name="Facenet",
+                enforce_detection=False, detector_backend="skip")
+            embedding = np.asarray(result[0]['embedding'], dtype=np.float64)
+            norm = np.linalg.norm(embedding)
+            if norm <= 0 or len(embedding) == 0:
+                return None
+            return embedding / norm
+        except Exception:
+            return None
+
+    def _deepface_usable(self):
+        """Lazily probe whether the DeepFace backend is available.
+
+        Returns:
+            True when DeepFace.represent can be used, False otherwise
+            (the histogram fallback is then used).
+        """
+        if self._deepface_available is None:
+            probe = np.zeros((64, 64, 3), dtype=np.uint8)
+            self._deepface_available = self._deepface_embedding(probe) is not None
+        return self._deepface_available
+
+    def _embedding_for_path(self, path):
+        """Return the cached DeepFace embedding for a stored crop file."""
+        if path not in self._embedding_cache:
+            crop = cv2.imread(path, cv2.IMREAD_COLOR)
+            self._embedding_cache[path] = (
+                self._deepface_embedding(crop) if crop is not None else None)
+        return self._embedding_cache[path]
+
     def _face_hist_for_path(self, path):
         """Return the cached HSV histogram for a stored crop file."""
         if path not in self._face_hist_cache:
@@ -995,16 +1073,21 @@ class CropMemory:
         """Reuse an existing face crop when a track ID was reassigned.
 
         ByteTrack can re-assign a person to a fresh ``track_id`` during a
-        partial occlusion (``#8`` -> ``#14``). Instead of comparing spatial
-        positions, this method compares **visual features**: the candidate
-        crop's HSV histogram is correlated against the histograms of every
-        stored employee crop. When the best correlation exceeds
-        ``face_sim_threshold`` (> 0.75) the crops show the same face:
+        partial occlusion (``#8`` -> ``#14``). Matching is identity-based
+        on **deep facial embeddings** (DeepFace / FaceNet, 512-D):
 
-        - the current ``track_id`` is aliased to the stored identity;
-        - no new image file is created;
-        - if the candidate is clearer than the stored crop, the stored file
-          is replaced by it (keeping the best clarity version).
+        - the candidate crop's embedding is compared (cosine distance)
+          against the embeddings of every stored employee crop in
+          ``data/outputs/crops/faces/``;
+        - the closest identity with cosine distance < ``face_match_distance``
+          (0.40 by default) is the same physical person: the current
+          ``track_id`` is aliased to that identity, no new image file is
+          created, and if the candidate is clearer than the stored crop the
+          stored file is replaced by it (highest clarity kept).
+
+        When the DeepFace backend is unavailable (package not installed or
+        model load failure), it gracefully falls back to the HSV histogram
+        correlation matcher with ``face_sim_threshold``.
 
         Args:
             crop: Extracted candidate face crop (BGR).
@@ -1014,13 +1097,46 @@ class CropMemory:
             Relative path of the existing (reused) crop, or None when the
             candidate is considered a fresh identity.
         """
+        match = self._match_by_embedding(crop, track_id)
+        if match is not None:
+            return match
+        return self._match_by_histogram(crop, track_id)
+
+    def _match_by_embedding(self, crop, track_id):
+        """DeepFace embedding matcher (returns alias path or None)."""
+        if not self._deepface_usable():
+            return None
+
+        candidate = self._deepface_embedding(crop)
+        if candidate is None:
+            return None
+
+        best_id = None
+        best_dist = None
+        for prev_id in self._iter_stored_face_ids():
+            if prev_id == track_id:
+                continue
+            prev_path = os.path.join(self.faces_dir, f"pedestrian_{prev_id}.jpg")
+            prev_emb = self._embedding_for_path(prev_path)
+            if prev_emb is None:
+                continue
+            dist = self._cosine_distance(candidate, prev_emb)
+            if best_dist is None or dist < best_dist:
+                best_dist = dist
+                best_id = prev_id
+
+        if best_id is None or best_dist >= self.face_match_distance:
+            return None
+        return self._alias_to(best_id, crop, track_id)
+
+    def _match_by_histogram(self, crop, track_id):
+        """HSV histogram fallback matcher; returns alias path or None."""
         candidate_hist = self._face_histogram(crop)
         if candidate_hist is None:
             return None
 
         best_id = None
         best_score = 0.0
-        rel_dir = os.path.relpath(self.faces_dir, self.root_dir)
         for prev_id in self._iter_stored_face_ids():
             if prev_id == track_id:
                 continue
@@ -1035,21 +1151,38 @@ class CropMemory:
 
         if best_id is None or best_score <= self.face_sim_threshold:
             return None
+        return self._alias_to(best_id, crop, track_id)
 
-        # Alias the reassigned id to the existing physical identity.
+    def _alias_to(self, best_id, crop, track_id):
+        """Alias ``track_id`` to the stored identity ``best_id``.
+
+        Registers the alias, avoids writing a duplicate image file for the
+        matched identity and keeps the highest-clarity crop for the
+        identity: when the candidate is clearer than the stored crop the
+        stored file is rewritten in place (never creating a new file) and
+        the corresponding feature caches are invalidated.
+
+        Args:
+            best_id: Numeric id of the stored (canonical) identity.
+            crop: Candidate face crop that may replace the stored image.
+            track_id: Newly observed track id being aliased.
+
+        Returns:
+            Project-relative path of the reused stored crop.
+        """
         self._saved_face_ids.add(track_id)
         self._face_frame_counts.pop(track_id, None)
         self._face_alias_map[track_id] = best_id
 
-        # Keep the highest clarity candidate for the identity: the stored
-        # file is rewritten (not re-created) when the new crop is clearer.
         best_path = os.path.join(self.faces_dir, f"pedestrian_{best_id}.jpg")
         if self._image_clarity(crop) > self._face_clarity_for(best_path):
             cv2.imwrite(best_path, crop)
             self._face_hist_cache.pop(best_path, None)
+            self._embedding_cache.pop(best_path, None)
             self._face_clarity_cache[best_path] = self._image_clarity(crop)
 
-        return os.path.join(rel, f"pedestrian_{best_id}.jpg")
+        return os.path.join(os.path.relpath(self.faces_dir, self.root_dir),
+                            f"pedestrian_{best_id}.jpg")
 
     def mark_frame_observations(self, observed_track_ids):
         """Reset consecutive observation streaks for absent face tracks.
