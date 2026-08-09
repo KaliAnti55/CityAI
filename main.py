@@ -132,8 +132,8 @@ def parse_args():
                         help="ByteTrack buffer length in frames (higher values survive occlusions without new track IDs)")
     parser.add_argument("--match-thresh", type=float, default=0.8,
                         help="ByteTrack matching threshold used for tracker persistence")
-    parser.add_argument("--face-detector", type=str, default="auto",
-                        help="Face detection backend for direct face cropping (auto = gemini-3.5-flash-lite when an API key is present, else opencv; gemini; deepface backends: opencv, mtcnn, retinaface, ssd; 'none' disables)")
+    parser.add_argument("--face-detector", type=str, default="local",
+                        help="Face detection backend for direct face cropping (local = InsightFace SCRFD buffalov8, zero network calls; deepface backends: opencv, mtcnn, retinaface, ssd; gemini = offline-only for reporting; 'none' disables)")
     return parser.parse_args()
 
 def main():

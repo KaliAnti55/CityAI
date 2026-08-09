@@ -68,7 +68,7 @@ class CityDetector:
 
     def __init__(self, model_path="yolov8x.pt", conf_thresh=0.25, iop_thresh=0.45,
                  use_tracking=True, employee_mode=False, nms_iou_thresh=0.45,
-                 track_buffer=60, match_thresh=0.8, face_detector_backend="opencv"):
+                 track_buffer=60, match_thresh=0.8, face_detector_backend="local"):
         # Accept either a loaded YOLO object or a string file path
         if isinstance(model_path, str):
             self.model = YOLO(model_path)
@@ -80,33 +80,29 @@ class CityDetector:
         self.use_tracking = use_tracking
         self.employee_mode = employee_mode
 
-        # Face detection stage: a dedicated face detector runs on the raw
+        # Face detection stage: a dedicated local face detector runs on the raw
         # frame and binds explicit face boxes (``face_bbox``) to tracked
-        # persons for direct face cropping downstream.
+        # persons for direct face cropping downstream. Zero network calls
+        # happen in the frame loop.
         #
-        #   "gemini" -> Gemini vision model primary, OpenCV (DeepFace)
-        #               fallback when the API key is missing or calls fail
-        #   "auto"   -> Gemini when GEMINI_API_KEY/GOOGLE_API_KEY is present,
-        #               otherwise the local OpenCV detector (default)
-        #   <backend>-> local DeepFace built-in detector (retinaface, mtcnn,
-        #               opencv, ssd, ...)
+        #   "insightface"/"local"/"auto"/"scrfd" -> InsightFace FaceAnalysis
+        #       (SCRFD det_10g + ArcFace, ``buffalov8`` pack), GPU when
+        #       CUDA is available, CPU otherwise (default)
+        #   "gemini" -> Gemini is reserved for offline post-processing only;
+        #               the frame loop runs the local InsightFace detector
+        #   <backend> -> local DeepFace built-in detector (retinaface, mtcnn,
+        #                opencv, ssd, ...)
         #   "none"   -> explicit face stage disabled entirely
         backend = (face_detector_backend or "").strip().lower()
-        gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
         if backend in ("", "none", "disabled"):
             self.face_detector_backend = None
-            self._gemini_enabled = False
-        elif backend == "gemini":
-            self.face_detector_backend = "opencv"  # local fallback backend
-            self._gemini_enabled = True
-        elif backend == "auto":
-            self.face_detector_backend = "opencv"
-            self._gemini_enabled = bool(gemini_key)
+        elif backend in ("insightface", "local", "auto", "scrfd", "gemini"):
+            self.face_detector_backend = "insightface"
         else:
             self.face_detector_backend = backend
-            self._gemini_enabled = False
         self._face_detector = None
-        self._gemini_client = None
+        self._face_analyzer = None
+        self._gemini_client = None  # offline-only (reporting) stage
 
         # NMS pre-filtering for duplicate/overlapping person boxes
         self.nms_iou_thresh = nms_iou_thresh
@@ -217,13 +213,13 @@ class CityDetector:
         return inter / union if union > 0 else 0.0
 
     def detect_faces(self, frame):
-        """Top-level face detector: Gemini when enabled, local otherwise.
+        """Run the configured local face detector on the raw video frame.
 
-        Routes to ``detect_faces_gemini`` when the Gemini mode is active
-        (``--face-detector gemini``, or ``auto`` with an API key present).
-        When Gemini is unavailable (no API key, package missing, API error)
-        or returns no boxes, detection falls back gracefully to the local
-        detector so the pipeline never stalls.
+        Primary backend is InsightFace FaceAnalysis (SCRFD ``buffalov8``),
+        executed fully locally via ONNX/CUDA with zero network requests so
+        the frame loop keeps maximum FPS. When InsightFace is unavailable
+        it gracefully falls back to the configured DeepFace backend
+        (``opencv`` by default).
 
         Args:
             frame: Current video frame (BGR).
@@ -232,16 +228,87 @@ class CityDetector:
             List of ``(x1, y1, x2, y2, confidence)`` face boxes in absolute
             frame coordinates; empty when the stage is disabled entirely.
         """
-        if self._gemini_enabled:
-            face_boxes = self.detect_faces_gemini(frame)
+        if self.face_detector_backend is None:
+            return []
+        if self.face_detector_backend == "insightface":
+            face_boxes = self._detect_faces_scrfd(frame)
             if face_boxes:
                 return face_boxes
-            # Graceful fallback: the local backend is pinned to "opencv" in
-            # gemini/auto modes, so the fallback is always OpenCV.
+            # Graceful fallback when the InsightFace pack is missing or the
+            # ONNX runtime cannot load the models: the DeepFace OpenCV path.
+            return self._detect_faces_local(frame, backend="opencv")
         return self._detect_faces_local(frame)
 
+    def _get_face_analyzer(self):
+        """Lazily initialize the InsightFace FaceAnalysis (SCRFD + ArcFace).
+
+        Loads the high-speed ``buffalov8`` model pack (SCRFD-10GF face
+        detector + ArcFace recognition) on the best available ONNX
+        execution provider: CUDA when the runtime provides it, CPU
+        otherwise.
+
+        Returns:
+            Configured ``FaceAnalysis`` instance, or None when InsightFace
+            / the ONNX runtime is unavailable or model loading failed.
+        """
+        if self._face_analyzer is None:
+            try:
+                import onnxruntime as ort
+                from insightface.app import FaceAnalysis
+
+                preferred = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+                available = set(ort.get_available_providers())
+                providers = [p for p in preferred if p in available]
+                if not providers:
+                    providers = ['CPUExecutionProvider']
+
+                try:
+                    analyzer = FaceAnalysis(name='buffalov8', providers=providers)
+                except Exception:
+                    analyzer = FaceAnalysis(name='buffalo_l', providers=providers)
+                analyzer.prepare(
+                    ctx_id=0 if 'CUDAExecutionProvider' in providers else -1,
+                    det_size=(640, 640))
+                self._face_analyzer = analyzer
+            except Exception:
+                self._face_analyzer = False
+        return self._face_analyzer or None
+
+    def _detect_faces_scrfd(self, frame):
+        """Locate human faces directly on the raw frame via SCRFD.
+
+        Args:
+            frame: Current video frame (BGR).
+
+        Returns:
+            List of ``(x1, y1, x2, y2, det_score)`` face boxes in absolute
+            frame coordinates; empty when the analyzer is unavailable or
+            detection fails.
+        """
+        analyzer = self._get_face_analyzer()
+        if analyzer is None:
+            return []
+        try:
+            faces = analyzer.get(frame)
+            boxes = []
+            for face in faces:
+                bbox = getattr(face, 'bbox', None)
+                if bbox is None or len(bbox) < 4:
+                    continue
+                x1, y1, x2, y2 = (float(v) for v in bbox[:4])
+                det_score = float(getattr(face, 'det_score', 0.0) or 0.0)
+                boxes.append((x1, y1, x2, y2, det_score))
+            return boxes
+        except Exception:
+            return []
+
     def detect_faces_gemini(self, frame):
-        """Detect human faces with a Gemini vision model producing native boxes.
+        """Detect human faces with a Gemini vision model (offline stage only).
+
+        Reserved strictly for offline post-processing (e.g. ``--save-md``
+        activity report generation after stream processing completes); it
+        is **never invoked from the per-frame loop** so the frame pipeline
+        performs zero network requests.
 
         Sends the raw frame to the model under the JSON response contract
         ``{"faces": [{"box_2d": [ymin, xmin, ymax, xmax]}]}`` where all
@@ -254,8 +321,7 @@ class CityDetector:
         Returns:
             List of ``(x1, y1, x2, y2, None)`` face boxes in absolute frame
             coordinates; empty when the API key is missing, the
-            ``google-genai`` package is unavailable or the API call fails
-            (callers then fall back to the local detector).
+            ``google-genai`` package is unavailable or the API call fails.
         """
         try:
             if self._gemini_client is None:
@@ -334,18 +400,21 @@ class CityDetector:
         except Exception:
             return []
 
-    def _detect_faces_local(self, frame):
+    def _detect_faces_local(self, frame, backend=None):
         """Run the configured local (DeepFace) face detector on the frame.
 
         Args:
             frame: Current video frame (BGR).
+            backend: Override for the local detector backend name (e.g.
+                ``"opencv"`` for the fallback path).
 
         Returns:
             List of ``(x1, y1, x2, y2, confidence)`` face boxes in absolute
             frame coordinates; empty when the stage is disabled or the
             backend is unavailable.
         """
-        if self.face_detector_backend is None:
+        local_backend = backend or self.face_detector_backend
+        if local_backend is None:
             return []
         if self._face_detector is None:
             try:
@@ -357,7 +426,7 @@ class CityDetector:
             return []
         try:
             results = self._face_detector.extract_faces(
-                img_path=frame, detector_backend=self.face_detector_backend,
+                img_path=frame, detector_backend=local_backend,
                 enforce_detection=False, align=False)
             boxes = []
             for result in results:

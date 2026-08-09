@@ -30,7 +30,7 @@ class CropMemory:
                  target_plates=None, telegram_token=None, telegram_chat_id=None,
                  gemini_api_key=None, entry_line_y=0.5, crossing_cooldown_frames=30,
                  loitering_threshold=10, face_min_ratio=0.75, face_max_ratio=1.75,
-                 face_min_size=24, face_sim_threshold=0.75, face_match_distance=0.50):
+                 face_min_size=24, face_sim_threshold=0.75, face_match_distance=0.40):
         """Initialize the crop memory store.
 
         Args:
@@ -79,12 +79,13 @@ class CropMemory:
                 discarded without saving (default 24).
             face_sim_threshold: HSV histogram correlation fallback score
                 above which a face crop is considered the same physical
-                person when the DeepFace embedding backend is unavailable
+                person when no face embedding backend is available
                 (default 0.75).
-            face_match_distance: Cosine distance threshold for the DeepFace
-                embedding backend; a candidate crop within this distance of
-                a stored crop is matched to the same physical identity
-                (default 0.50).
+            face_match_distance: Cosine distance threshold for the ArcFace
+                (InsightFace, primary) / DeepFace (FaceNet, fallback)
+                embedding backends; a candidate crop within this distance
+                of a stored crop is matched to the same physical identity
+                (default 0.40).
         """
         self.root_dir = root_dir
         self.faces_dir = os.path.join(root_dir, faces_subdir)
@@ -125,6 +126,8 @@ class CropMemory:
         self.face_sim_threshold = face_sim_threshold
         self.face_match_distance = face_match_distance
         self._deepface_available = None
+        self._arcface_available = None
+        self._arcface_analyzer = None
         self._embedding_cache = {}
         self._face_hist_cache = {}
         self._face_clarity_cache = {}
@@ -835,11 +838,12 @@ class CropMemory:
 
         When the crop passes, its **facial identity** is verified against
         every stored employee crop in ``data/outputs/crops/faces/`` using
-        a DeepFace (FaceNet) 512-D embedding: the closest stored identity
-        with cosine distance < ``face_match_distance`` (0.50) is aliased —
-        no new image is written, and if the candidate is clearer than the
-        stored image the stored file is replaced (identity image is always
-        the highest-clarity version).
+        a high-precision ArcFace (InsightFace, 512-D) embedding: the
+        closest stored identity with cosine distance <
+        ``face_match_distance`` (0.40) is aliased — no new image is
+        written, and if the candidate is clearer than the stored image
+        the stored file is replaced (identity image is always the
+        highest-clarity version).
 
         Args:
             frame: Current video frame (BGR).
@@ -1029,12 +1033,107 @@ class CropMemory:
             self._deepface_available = self._deepface_embedding(probe) is not None
         return self._deepface_available
 
+    def _get_arcface_analyzer(self):
+        """Lazily initialize the InsightFace FaceAnalysis (SCRFD + ArcFace).
+
+        Loads the high-speed ``buffalov8`` model pack (SCRFD-10GF face
+        detector + ArcFace recognition) on the best available ONNX
+        execution provider, CUDA when the runtime provides it and CPU
+        otherwise; falls back to the ``buffalo_l`` pack when ``buffalov8``
+        is unavailable.
+
+        Returns:
+            Configured ``FaceAnalysis`` instance, or None when InsightFace
+            / the ONNX runtime is unavailable or model loading failed.
+        """
+        if self._arcface_analyzer is None:
+            try:
+                import onnxruntime as ort
+                from insightface.app import FaceAnalysis
+
+                preferred = ['CUDAExecutionProvider', 'CPUExecutionProvider']
+                available = set(ort.get_available_providers())
+                providers = [p for p in preferred if p in available]
+                if not providers:
+                    providers = ['CPUExecutionProvider']
+
+                try:
+                    analyzer = FaceAnalysis(name='buffalov8', providers=providers)
+                except Exception:
+                    analyzer = FaceAnalysis(name='buffalo_l', providers=providers)
+                analyzer.prepare(
+                    ctx_id=0 if 'CUDAExecutionProvider' in providers else -1,
+                    det_size=(640, 640))
+                self._arcface_analyzer = analyzer
+            except Exception:
+                self._arcface_analyzer = False
+        return self._arcface_analyzer or None
+
+    def _arcface_usable(self):
+        """Lazily probe whether the InsightFace ArcFace backend is available.
+
+        Returns:
+            True when the ArcFace recognition model can be used, False
+            otherwise (the DeepFace / histogram fallbacks are then used).
+        """
+        if self._arcface_available is None:
+            self._arcface_available = self._get_arcface_analyzer() is not None
+        return self._arcface_available
+
+    def _arcface_embedding(self, crop):
+        """Extract a normalized 512-D ArcFace embedding from a face crop.
+
+        Unsupervised recognition stage of the InsightFace analyzer: the
+        crop is upscaled first so SCRFD reliably detects the face and
+        ArcFace produces a stable, L2-normalized 512-D embedding (which
+        makes cosine distance = 1.0 - dot product).
+
+        Returns:
+            Normalized 512-D embedding array, or None when InsightFace is
+            unavailable or no face could be embedded from the crop.
+        """
+        analyzer = self._get_arcface_analyzer()
+        if analyzer is None:
+            return None
+        try:
+            h, w = crop.shape[:2]
+            if min(h, w) < 96:
+                scale = 160.0 / min(h, w)
+                crop = cv2.resize(crop, None, fx=scale, fy=scale,
+                                  interpolation=cv2.INTER_LINEAR)
+            faces = analyzer.get(crop)
+            if not faces:
+                return None
+            embedding = np.asarray(faces[0].embedding, dtype=np.float64)
+            norm = np.linalg.norm(embedding)
+            if norm <= 0 or len(embedding) == 0:
+                return None
+            return embedding / norm
+        except Exception:
+            return None
+
     def _embedding_for_path(self, path):
-        """Return the cached DeepFace embedding for a stored crop file."""
+        """Return the cached face embedding for a stored crop file.
+
+        Primary backend is InsightFace ArcFace; the DeepFace (FaceNet)
+        backend is used as a fallback when InsightFace is unavailable.
+
+        Args:
+            path: Absolute path of a stored face crop.
+
+        Returns:
+            Normalized 512-D embedding array, or None when no backend
+            could embed the stored crop.
+        """
         if path not in self._embedding_cache:
             crop = cv2.imread(path, cv2.IMREAD_COLOR)
-            self._embedding_cache[path] = (
-                self._deepface_embedding(crop) if crop is not None else None)
+            if crop is None:
+                self._embedding_cache[path] = None
+            else:
+                embedding = self._arcface_embedding(crop)
+                if embedding is None:
+                    embedding = self._deepface_embedding(crop)
+                self._embedding_cache[path] = embedding
         return self._embedding_cache[path]
 
     def _face_hist_for_path(self, path):
@@ -1058,19 +1157,21 @@ class CropMemory:
 
         ByteTrack can re-assign a person to a fresh ``track_id`` during a
         partial occlusion (``#8`` -> ``#14``). Matching is identity-based
-        on **deep facial embeddings** (DeepFace / FaceNet, 512-D):
+        on **high-precision ArcFace facial embeddings** (InsightFace,
+        512-D, cosine distance):
 
         - the candidate crop's embedding is compared (cosine distance)
           against the embeddings of every stored employee crop in
           ``data/outputs/crops/faces/``;
         - the closest identity with cosine distance < ``face_match_distance``
-          (0.50 by default) is the same physical person: the current
+          (0.40 by default) is the same physical person: the current
           ``track_id`` is aliased to that identity, no new image file is
           created, and if the candidate is clearer than the stored crop the
           stored file is replaced by it (highest clarity kept).
 
-        When the DeepFace backend is unavailable (package not installed or
-        model load failure), it gracefully falls back to the HSV histogram
+        When the InsightFace backend is unavailable (package not installed
+        or model load failure), it gracefully falls back to the DeepFace /
+        FaceNet embedding matcher and finally to the HSV histogram
         correlation matcher with ``face_sim_threshold``.
 
         Args:
@@ -1087,11 +1188,18 @@ class CropMemory:
         return self._match_by_histogram(crop, track_id)
 
     def _match_by_embedding(self, crop, track_id):
-        """DeepFace embedding matcher (returns alias path or None)."""
-        if not self._deepface_usable():
+        """Face embedding matcher (ArcFace primary, DeepFace fallback).
+
+        Returns the alias path for the closest stored identity whose
+        cosine distance to the candidate crop is below
+        ``face_match_distance``, else None.
+        """
+        if not (self._arcface_usable() or self._deepface_usable()):
             return None
 
-        candidate = self._deepface_embedding(crop)
+        candidate = self._arcface_embedding(crop)
+        if candidate is None:
+            candidate = self._deepface_embedding(crop)
         if candidate is None:
             return None
 
