@@ -1,6 +1,47 @@
 import numpy as np
 from ultralytics import YOLO
 
+def non_max_suppression(boxes, scores, iou_thresh=0.45):
+    """Greedy Non-Maximum Suppression over absolute ``(x1, y1, x2, y2)`` boxes.
+
+    Given per-box confidence scores, iteratively keeps the highest-scoring
+    box and suppresses remaining boxes whose IoU with it exceeds
+    ``iou_thresh``. Overlapping or duplicate detections of the same
+    physical object (e.g. a partially occluded employee) are collapsed
+    into a single box.
+
+    Args:
+        boxes: Iterable of ``(x1, y1, x2, y2)`` detection boxes.
+        scores: Iterable of matching confidence scores.
+        iou_thresh: IoU threshold above which a box is suppressed.
+
+    Returns:
+        List of kept indices into the original ``boxes`` sequence.
+    """
+    arr = np.asarray(boxes, dtype=np.float64).reshape(-1, 4)
+    scores = np.asarray(scores, dtype=np.float64).reshape(-1)
+    if arr.shape[0] == 0:
+        return []
+    x1, y1, x2, y2 = arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3]
+    areas = np.maximum(x2 - x1, 0.0) * np.maximum(y2 - y1, 0.0)
+    order = scores.argsort()[::-1]
+    keep = []
+    while order.size > 0:
+        i = int(order[0])
+        keep.append(i)
+        if order.size == 1:
+            break
+        rest = order[1:]
+        xx1 = np.maximum(x1[rest], x1[i])
+        yy1 = np.maximum(y1[rest], y1[i])
+        xx2 = np.minimum(x2[rest], x2[i])
+        yy2 = np.minimum(y2[rest], y2[i])
+        inter = np.maximum(xx2 - xx1, 0.0) * np.maximum(yy2 - yy1, 0.0)
+        denom = areas[rest] + areas[i] - inter
+        iou = np.divide(inter, denom, out=np.zeros_like(inter), where=denom > 0)
+        order = rest[iou <= iou_thresh]
+    return keep
+
 class CityDetector:
     """Detection, tracking and micro-mobility association engine.
 
@@ -9,10 +50,16 @@ class CityDetector:
     across frames. Preserves the feet-anchored IoP rider association logic.
     In ``employee_mode`` the detection targets are restricted to ``person``
     (COCO index 0) for workplace employee tracking.
+
+    Duplicate/overlapping person detections are collapsed with NMS on the
+    tracker output, and the ByteTrack buffer is tuned so track IDs
+    survive short occlusions instead of being re-assigned (``#8`` ->
+    ``#14``).
     """
 
     def __init__(self, model_path="yolov8x.pt", conf_thresh=0.25, iop_thresh=0.45,
-                 use_tracking=True, employee_mode=False):
+                 use_tracking=True, employee_mode=False, nms_iou_thresh=0.45,
+                 track_buffer=60, match_thresh=0.8):
         # Accept either a loaded YOLO object or a string file path
         if isinstance(model_path, str):
             self.model = YOLO(model_path)
@@ -23,6 +70,14 @@ class CityDetector:
         self.iop_thresh = iop_thresh
         self.use_tracking = use_tracking
         self.employee_mode = employee_mode
+
+        # NMS pre-filtering for duplicate/overlapping person boxes
+        self.nms_iou_thresh = nms_iou_thresh
+
+        # ByteTrack persistence tuning: buffered tracks survive temporary
+        # occlusions so identities are kept rather than re-assigned.
+        self.track_buffer = track_buffer
+        self.match_thresh = match_thresh
         
         # Micro-mobility classes that allow active riders
         self.rider_vehicle_classes = ['bicycle', 'motorcycle']
@@ -72,8 +127,11 @@ class CityDetector:
         """Run YOLO inference, enabling online tracking when configured.
 
         Uses ``model.track`` (ByteTrack) with ``persist=True`` so track
-        identities are carried across frames. Falls back to plain
-        detection if the tracker is unavailable in the current runtime.
+        identities are carried across frames, and with a longer
+        ``track_buffer`` / tighter ``match_thresh`` so identities survive
+        brief occlusions without being re-assigned fresh IDs. Falls back
+        to plain detection if the tracker is unavailable in the current
+        runtime.
 
         Returns:
             Ultralytics result object for the current frame.
@@ -81,7 +139,9 @@ class CityDetector:
         if self.use_tracking:
             try:
                 return self.model.track(frame, conf=self.conf_thresh,
-                                        persist=True, verbose=False)[0]
+                                        persist=True, verbose=False,
+                                        track_buffer=self.track_buffer,
+                                        match_thresh=self.match_thresh)[0]
             except Exception:
                 pass
         return self.model(frame, conf=self.conf_thresh, verbose=False)[0]
@@ -137,7 +197,18 @@ class CityDetector:
                     rider_eligible_vehicles.append(item)
                 elif label in self.enclosed_vehicle_classes:
                     enclosed_vehicles.append(item)
-                    
+
+        # Collapse overlapping / duplicate person detections (e.g. a
+        # partially occluded employee) into a single box before association,
+        # so one physical person does not produce double bounding boxes
+        # (and duplicate face crops downstream).
+        if len(pedestrians) > 1:
+            keep = non_max_suppression(
+                [ped['bbox'] for ped in pedestrians],
+                [ped['confidence'] for ped in pedestrians],
+                iou_thresh=self.nms_iou_thresh)
+            pedestrians = [pedestrians[i] for i in keep]
+
         active_riders = []
         standalone_pedestrians = []
         

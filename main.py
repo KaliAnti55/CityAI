@@ -7,15 +7,18 @@ from src.detector import CityMobilityDetector
 from src.visualizer import Visualizer
 from src.memory import CropMemory
 
-def record_face_crops(frame, telemetry, memory):
+def record_face_crops(frame, telemetry, memory, frame_index):
     """Persist face crops for stable tracked pedestrians and annotate telemetry.
 
     For every person (standalone pedestrian or active rider) carrying a
     ``track_id``, requests a one-time face crop save from ``memory``
     (which only fires after the track has been stable for consecutive
     frames) and, on first save, attaches the resulting crop path to the
-    telemetry entry. Person track ids observed this frame are reported so
-    the memory module can reset streaks of tracks that disappeared.
+    telemetry entry. ``frame_index`` is forwarded so the memory layer can
+    deduplicate crops when a ByteTrack ID reassignment aliases the same
+    physical employee to a new track id. Person track ids observed this
+    frame are reported so the memory module can reset streaks of tracks
+    that disappeared.
     """
     persons = telemetry.get('pedestrians', []) + telemetry.get('active_riders', [])
     person_ids = set()
@@ -24,7 +27,8 @@ def record_face_crops(frame, telemetry, memory):
         if track_id is None:
             continue
         person_ids.add(track_id)
-        crop_path = memory.save_face_crop(frame, person['bbox'], track_id)
+        crop_path = memory.save_face_crop(frame, person['bbox'], track_id,
+                                          frame_index=frame_index)
         if crop_path is not None:
             person['face_crop_path'] = crop_path
     memory.mark_frame_observations(person_ids)
@@ -119,6 +123,12 @@ def parse_args():
                         help="Vertical position of the ENTRY/EXIT crossing line as a fraction of frame height")
     parser.add_argument("--loitering-threshold", type=int, default=10,
                         help="Dwell time in seconds after which an employee is flagged for loitering")
+    parser.add_argument("--nms-iou-thresh", type=float, default=0.45,
+                        help="IoU threshold for Non-Maximum Suppression on overlapping person detections")
+    parser.add_argument("--track-buffer", type=int, default=60,
+                        help="ByteTrack buffer length in frames (higher values survive occlusions without new track IDs)")
+    parser.add_argument("--match-thresh", type=float, default=0.8,
+                        help="ByteTrack matching threshold used for tracker persistence")
     return parser.parse_args()
 
 def main():
@@ -128,7 +138,10 @@ def main():
     source = int(args.source) if args.source.isdigit() else args.source
     
     detector = CityMobilityDetector(model_path=args.weights, conf_thresh=args.conf,
-                                    iop_thresh=args.iop_thresh, employee_mode=args.employee_mode)
+                                    iop_thresh=args.iop_thresh, employee_mode=args.employee_mode,
+                                    nms_iou_thresh=args.nms_iou_thresh,
+                                    track_buffer=args.track_buffer,
+                                    match_thresh=args.match_thresh)
     visualizer = Visualizer(employee_mode=args.employee_mode)
     target_plates = set()
     if args.target_plates:
@@ -183,7 +196,7 @@ def main():
         if args.employee_mode:
             track_employees(telemetry, memory, time.time(), frame_count)
             track_entry_exits(frame, telemetry, memory, frame_count)
-        record_face_crops(frame, telemetry, memory)
+        record_face_crops(frame, telemetry, memory, frame_count)
         record_vehicle_crops(frame, telemetry, memory)
         last_telemetry = telemetry
         

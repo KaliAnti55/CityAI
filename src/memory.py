@@ -2,6 +2,7 @@ import os
 import re
 import threading
 from datetime import datetime
+import numpy as np
 import cv2
 
 
@@ -27,7 +28,8 @@ class CropMemory:
                  ocr_reader=None, ocr_conf_thresh=0.35,
                  target_plates=None, telegram_token=None, telegram_chat_id=None,
                  gemini_api_key=None, entry_line_y=0.5, crossing_cooldown_frames=30,
-                 loitering_threshold=10):
+                 loitering_threshold=10, face_dedup_window_frames=300,
+                 face_dedup_radius_scale=0.5):
         """Initialize the crop memory store.
 
         Args:
@@ -65,6 +67,13 @@ class CropMemory:
             loitering_threshold: Dwell time in seconds after which an
                 employee is flagged as loitering and a loitering event
                 is recorded (default 10).
+            face_dedup_window_frames: Maximum frames between an exported
+                face crop and a spatially matching crop that are still
+                considered the same physical person (default 300).
+            face_dedup_radius_scale: Multiplier of the head-box size used
+                as the spatial tolerance when matching a suspected
+                track-ID-reassigned crop to a previously exported face
+                (default 0.5).
         """
         self.root_dir = root_dir
         self.faces_dir = os.path.join(root_dir, faces_subdir)
@@ -96,6 +105,10 @@ class CropMemory:
         self._crossing_states = {}
         self.loitering_threshold = loitering_threshold
         self.loitering_events = []
+        self._face_saved_regions = {}
+        self._face_alias_map = {}
+        self.face_dedup_window_frames = face_dedup_window_frames
+        self.face_dedup_radius_scale = face_dedup_radius_scale
         self.target_plates = set()
         if target_plates:
             for target in target_plates:
@@ -634,7 +647,7 @@ class CropMemory:
         return rel_path
 
     def save_face_crop(self, frame, bbox, track_id, head_fraction=0.40,
-                       width_expansion=0.15, min_stable_frames=5):
+                       width_expansion=0.15, min_stable_frames=5, frame_index=None):
         """Save the face/head crop for a stable unique pedestrian, exactly once.
 
         The crop is only triggered once the ``track_id`` has been observed
@@ -642,6 +655,14 @@ class CropMemory:
         detections early in a track (low confidence or unstable boxes)
         never produce a crop. Each unique ``track_id`` is still saved
         exactly once.
+
+        When ByteTrack re-assigns a person's identity mid-occlusion
+        (``#8`` -> ``#14``), the same physical employee is exposed under a
+        fresh ``track_id``. To avoid exporting a second (duplicate) face
+        for the same person, a pending crop that spatially matches a
+        previously exported face crop (within ``face_dedup_window_frames``)
+        is aliased to the original crop and its path is returned without a
+        new file being written.
 
         Args:
             frame: Current video frame (BGR).
@@ -651,6 +672,9 @@ class CropMemory:
             width_expansion: Fraction of the box width added on each side.
             min_stable_frames: Minimum consecutive frames the track must
                 be observed for before the crop is saved.
+            frame_index: Optional current frame number; enables the recency
+                window for track-ID-switch deduplication. When None,
+                deduplication becomes location-based only.
 
         Returns:
             Crop path (relative to ``root_dir``) when the crop was saved
@@ -665,9 +689,69 @@ class CropMemory:
             return None
 
         region = self.compute_head_region(bbox, head_fraction, width_expansion)
+        region_w = region[2] - region[0]
+        region_h = region[3] - region[1]
+        center = ((region[0] + region[2]) / 2.0, (region[1] + region[3]) / 2.0)
+
+        # Track-ID-switch deduplication: suppress a second face export when a
+        # spatially matching face was already saved for this same physical
+        # person under a different (now stale) track id.
+        alias_path = self._match_previous_face_crop(center, max(region_w, region_h, 1.0),
+                                                    track_id, frame_index)
+        if alias_path is not None:
+            return alias_path
+
         filename = f"pedestrian_{track_id}.jpg"
-        return self._save_crop_once(frame, region, self.faces_dir, filename,
+        path = self._save_crop_once(frame, region, self.faces_dir, filename,
                                     track_id, self._saved_face_ids)
+        if path is not None:
+            self._face_saved_regions[track_id] = {
+                'center': center, 'path': path, 'frame': frame_index
+            }
+        return path
+
+    def _match_previous_face_crop(self, center, size, track_id, frame_index):
+        """Reuse an exported face crop when a track ID was reassigned.
+
+        ByteTrack can re-assign a person to a fresh ``track_id`` during a
+        partial occlusion (``#8`` -> ``#14``). Without deduplication this
+        yields a second, near-identical face crop for the same physical
+        employee. This lookup treats the pending crop as a duplicate of an
+        existing export when:
+
+        - their head-region centers are within ``size * face_dedup_radius_scale``;
+        - the prior export happened at most ``face_dedup_window_frames``
+          frames ago (skipped when no frame index is available).
+
+        On a match the new track id is aliased to the original so both the
+        face directory and the summary keep exactly one crop per identity.
+
+        Args:
+            center: (cx, cy) head-region center of the pending crop.
+            size: Reference head-box size used to scale the spatial tolerance.
+            track_id: Newly observed track id to alias on a match.
+            frame_index: Current frame number, or None to disable recency.
+
+        Returns:
+            Relative path of the existing (reused) crop, or None when the
+            pending crop is considered a fresh identity.
+        """
+        radius = size * self.face_dedup_radius_scale
+        for prev_id, previous in self._face_saved_regions.items():
+            if prev_id == track_id:
+                continue
+            pcx, pcy = previous['center']
+            if np.hypot(center[0] - pcx, center[1] - pcy) > radius:
+                continue
+            if frame_index is not None and previous.get('frame') is not None \
+                    and (frame_index - previous['frame']) > self.face_dedup_window_frames:
+                continue
+            # Alias the reassigned id to the original exported identity.
+            self._saved_face_ids.add(track_id)
+            self._face_frame_counts.pop(track_id, None)
+            self._face_alias_map[track_id] = prev_id
+            return previous['path']
+        return None
 
     def mark_frame_observations(self, observed_track_ids):
         """Reset consecutive observation streaks for absent face tracks.
@@ -832,6 +916,7 @@ class CropMemory:
         """
         return {
             'unique_faces_saved': len(self._saved_face_ids),
+            'face_aliases': len(self._face_alias_map),
             'unique_vehicles_saved': len(self._saved_vehicle_ids),
             'unique_plates_saved': len(self._saved_plate_ids),
             'employees_tracked': len(self._employee_records),
