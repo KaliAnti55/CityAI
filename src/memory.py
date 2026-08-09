@@ -3,7 +3,6 @@ import re
 import threading
 import time
 from datetime import datetime
-import numpy as np
 import cv2
 
 
@@ -29,8 +28,8 @@ class CropMemory:
                  ocr_reader=None, ocr_conf_thresh=0.35,
                  target_plates=None, telegram_token=None, telegram_chat_id=None,
                  gemini_api_key=None, entry_line_y=0.5, crossing_cooldown_frames=30,
-                 loitering_threshold=10, face_dedup_window_frames=300,
-                 face_dedup_radius_scale=0.5):
+                 loitering_threshold=10, face_min_ratio=0.5, face_max_ratio=2.0,
+                 face_sim_threshold=0.75):
         """Initialize the crop memory store.
 
         Args:
@@ -68,13 +67,15 @@ class CropMemory:
             loitering_threshold: Dwell time in seconds after which an
                 employee is flagged as loitering and a loitering event
                 is recorded (default 10).
-            face_dedup_window_frames: Maximum frames between an exported
-                face crop and a spatially matching crop that are still
-                considered the same physical person (default 300).
-            face_dedup_radius_scale: Multiplier of the head-box size used
-                as the spatial tolerance when matching a suspected
-                track-ID-reassigned crop to a previously exported face
-                (default 0.5).
+            face_min_ratio: Minimum height/width ratio of the face crop
+                region; distorted (chopped or heavily occluded) regions
+                below this ratio are rejected (default 0.5).
+            face_max_ratio: Maximum height/width ratio of the face crop
+                region accepted before it is considered distorted
+                (default 2.0).
+            face_sim_threshold: HSV histogram correlation score above
+                which a face crop is considered the same physical person
+                as a stored employee crop (default 0.75).
         """
         self.root_dir = root_dir
         self.faces_dir = os.path.join(root_dir, faces_subdir)
@@ -109,8 +110,11 @@ class CropMemory:
         self.loitering_events = []
         self._face_saved_regions = {}
         self._face_alias_map = {}
-        self.face_dedup_window_frames = face_dedup_window_frames
-        self.face_dedup_radius_scale = face_dedup_radius_scale
+        self.face_min_ratio = face_min_ratio
+        self.face_max_ratio = face_max_ratio
+        self.face_sim_threshold = face_sim_threshold
+        self._face_hist_cache = {}
+        self._face_clarity_cache = {}
         self.target_plates = set()
         if target_plates:
             for target in target_plates:
@@ -469,12 +473,67 @@ class CropMemory:
         return self._employee_records.get(track_id)
 
     def get_employee_records(self):
-        """Return the aggregated access telemetry for all tracked employees.
+        """Return telemetry per unique physical employee.
+
+        Track IDs that the face-deduplication aliased into the same
+        physical person (``#8`` -> ``#14``) are consolidated into a single
+        record keyed by the canonical identity. Each consolidated record
+        exposes the merged ``merged_track_ids`` history, earliest/latest
+        timestamps, best dwell estimate and any loitering flags raised by
+        any of its aliased segments.
 
         Returns:
-            List of employee telemetry records (one per unique track id).
+            List of per-physical-individual telemetry records.
         """
-        return list(self._employee_records.values())
+        groups = {}
+        for raw_id, record in self._employee_records.items():
+            canon = self._canonical_face_id(raw_id)
+            groups.setdefault(canon, []).append(record)
+
+        consolidated = []
+        for canon_id, records in groups.items():
+            track_ids = sorted(int(r['employee_track_id']) for r in records)
+            first_frames = [r['first_seen_frame'] for r in records
+                            if r.get('first_seen_frame') is not None]
+            last_frames = [r['last_seen_frame'] for r in records
+                           if r.get('last_seen_frame') is not None]
+            dwell = max((r.get('dwell_time_seconds') or 0.0) for r in records)
+            consolidated.append({
+                'employee_track_id': canon_id,
+                'merged_track_ids': track_ids,
+                'first_seen_timestamp':
+                    min(r['first_seen_timestamp'] for r in records),
+                'last_seen_timestamp':
+                    max(r['last_seen_timestamp'] for r in records),
+                'first_seen_frame': min(first_frames) if first_frames else None,
+                'last_seen_frame': max(last_frames) if last_frames else None,
+                'dwell_time_seconds': round(dwell, 2),
+                'zone_access_flag':
+                    any(bool(r.get('zone_access_flag')) for r in records),
+                'is_loitering':
+                    any(bool(r.get('is_loitering')) for r in records)
+            })
+
+        return consolidated
+
+    def _canonical_face_id(self, track_id):
+        """Resolve a track id to its canonical physical identity.
+
+        Follows the face-similarity alias map over chains (``#14 -> #8``
+        and ``#23 -> #14`` both resolve to ``#8``) so reporting counts
+        each unique physical employee exactly once.
+
+        Args:
+            track_id: Any (possibly aliased) employee ``track_id``.
+
+        Returns:
+            The canonical (original) track id of the physical person.
+        """
+        seen = set()
+        while track_id in self._face_alias_map and track_id not in seen:
+            seen.add(track_id)
+            track_id = self._face_alias_map[track_id]
+        return track_id
 
     @staticmethod
     def _format_duration(seconds):
@@ -519,11 +578,11 @@ class CropMemory:
     def export_markdown_report(self, output_path):
         """Write a human-readable Markdown activity report.
 
-        Produces an executive summary at the top (total employees tracked,
-        active monitoring duration and total loitering incidents) followed
-        by one detail block per tracked employee / pedestrian Track ID
-        covering first/last seen, total active dwell time, loitering
-        status and the associated face crop path.
+        Produces an executive summary at the top (unique physical
+        employees tracked, active monitoring duration and total loitering
+        incidents) followed by one detail block per unique employee Track
+        ID covering first/last seen, total active dwell time, loitering
+        status, merged track-ID history and the associated face crop path.
 
         Args:
             output_path: Destination file path for the ``.md`` report.
@@ -554,6 +613,7 @@ class CropMemory:
 
         for record in sorted(records, key=lambda r: r.get('employee_track_id') or 0):
             track_id = record.get('employee_track_id')
+            merged_ids = record.get('merged_track_ids') or [track_id]
             first_seen = record.get('first_seen_timestamp') or 'n/a'
             last_seen = record.get('last_seen_timestamp') or 'n/a'
             first_frame = record.get('first_seen_frame')
@@ -566,6 +626,9 @@ class CropMemory:
 
             lines.append(f"### Employee #{track_id}")
             lines.append("")
+            if len(merged_ids) > 1:
+                merged_text = ", ".join(f"#{mid}" for mid in merged_ids)
+                lines.append(f"- **Merged Track IDs:** {merged_text}")
             lines.append(f"- **First Seen:** {first_seen}"
                          f"{f' (frame {first_frame})' if first_frame is not None else ''}")
             lines.append(f"- **Last Seen:** {last_seen}"
@@ -769,13 +832,20 @@ class CropMemory:
         never produce a crop. Each unique ``track_id`` is still saved
         exactly once.
 
-        When ByteTrack re-assigns a person's identity mid-occlusion
-        (``#8`` -> ``#14``), the same physical employee is exposed under a
-        fresh ``track_id``. To avoid exporting a second (duplicate) face
-        for the same person, a pending crop that spatially matches a
-        previously exported face crop (within ``face_dedup_window_frames``)
-        is aliased to the original crop and its path is returned without a
-        new file being written.
+        Before persisting, the head region is verified for **face quality**:
+        its height/width aspect ratio must sit inside
+        ``(face_min_ratio, face_max_ratio)`` (a chopped forehead-only or
+        distended laptop-edge box is dropped) and it must not be cut off by
+        the frame borders. Crops failing this check are ignored for the
+        frame and retried on subsequent frames.
+
+        When the crop passes, its **visual features** (HSV histogram
+        correlation) are compared against every stored employee crop in
+        ``data/outputs/crops/faces/``. If the best correlation exceeds
+        ``face_sim_threshold`` (0.75 by default), the current ``track_id``
+        is aliased to the stored identity: no new image is written, and if
+        the candidate is clearer than the stored image the stored file is
+        replaced (identity image is always the highest-clarity version).
 
         Args:
             frame: Current video frame (BGR).
@@ -785,13 +855,12 @@ class CropMemory:
             width_expansion: Fraction of the box width added on each side.
             min_stable_frames: Minimum consecutive frames the track must
                 be observed for before the crop is saved.
-            frame_index: Optional current frame number; enables the recency
-                window for track-ID-switch deduplication. When None,
-                deduplication becomes location-based only.
+            frame_index: Optional current frame number (recorded with the
+                saved region for traceability).
 
         Returns:
-            Crop path (relative to ``root_dir``) when the crop was saved
-            for this ``track_id`` for the first time, otherwise None.
+            Crop path (relative to ``root_dir``) of the face stored for
+            this physical identity, otherwise None.
         """
         if track_id is None or track_id in self._saved_face_ids:
             return None
@@ -802,15 +871,19 @@ class CropMemory:
             return None
 
         region = self.compute_head_region(bbox, head_fraction, width_expansion)
-        region_w = region[2] - region[0]
-        region_h = region[3] - region[1]
-        center = ((region[0] + region[2]) / 2.0, (region[1] + region[3]) / 2.0)
 
-        # Track-ID-switch deduplication: suppress a second face export when a
-        # spatially matching face was already saved for this same physical
-        # person under a different (now stale) track id.
-        alias_path = self._match_previous_face_crop(center, max(region_w, region_h, 1.0),
-                                                    track_id, frame_index)
+        # Quality gate: full, unclipped face only (aspect ratio + borders).
+        if not self._face_geometry_ok(region, frame.shape):
+            return None
+
+        center = ((region[0] + region[2]) / 2.0, (region[1] + region[3]) / 2.0)
+        crop = self._extract_crop(frame, region)
+        if crop is None:
+            return None
+
+        # Visual similarity deduplication: reuse the existing crop file when
+        # the same physical face was already exported under another id.
+        alias_path = self._match_previous_face_crop(crop, track_id)
         if alias_path is not None:
             return alias_path
 
@@ -821,50 +894,162 @@ class CropMemory:
             self._face_saved_regions[track_id] = {
                 'center': center, 'path': path, 'frame': frame_index
             }
+            rel_dir = os.path.relpath(self.faces_dir, self.root_dir)
+            abs_path = os.path.join(self.root_dir, rel_dir, filename)
+            self._face_clarity_cache[abs_path] = self._image_clarity(crop)
         return path
 
-    def _match_previous_face_crop(self, center, size, track_id, frame_index):
-        """Reuse an exported face crop when a track ID was reassigned.
+    def _face_geometry_ok(self, region, frame_shape):
+        """Verify a head region contains a complete, unclipped face.
 
-        ByteTrack can re-assign a person to a fresh ``track_id`` during a
-        partial occlusion (``#8`` -> ``#14``). Without deduplication this
-        yields a second, near-identical face crop for the same physical
-        employee. This lookup treats the pending crop as a duplicate of an
-        existing export when:
-
-        - their head-region centers are within ``size * face_dedup_radius_scale``;
-        - the prior export happened at most ``face_dedup_window_frames``
-          frames ago (skipped when no frame index is available).
-
-        On a match the new track id is aliased to the original so both the
-        face directory and the summary keep exactly one crop per identity.
+        Rejects regions whose height/width ratio is distorted — typical of
+        chopped top-half / forehead-only detections or faces occluded by
+        desks/laptops — and regions that extend past the frame borders
+        (people cut off at the screen edge).
 
         Args:
-            center: (cx, cy) head-region center of the pending crop.
-            size: Reference head-box size used to scale the spatial tolerance.
+            region: (x1, y1, x2, y2) candidate face/head region.
+            frame_shape: Shape of the source frame.
+
+        Returns:
+            True when the region looks like a full, unobstructed face.
+        """
+        h, w = frame_size[:2]
+        x1, y1, x2, y2 = region
+        rw = x2 - x1
+        rh = y2 - y1
+        if rw <= 0 or rh <= 0:
+            return False
+        ratio = rh / rw
+        if ratio < self.face_min_ratio or ratio > self.face_max_ratio:
+            return False
+        if x1 < 0 or y1 < 0 or x2 > w or y2 > h:
+            return False
+        return True
+
+    def _iter_stored_face_ids(self):
+        """Yield the numeric ids of every stored face crop on disk.
+
+        Derived from the current session's saved regions plus any
+        ``pedestrian_*.jpg`` files already present in the faces directory
+        (earlier runs).
+        """
+        ids = set()
+        for fname in os.listdir(self.faces_dir):
+            match = re.match(r'^pedestrian_(\d+)\.jpg$', fname)
+            if match:
+                ids.add(int(match.group(1)))
+        for prev_id in self._face_saved_regions:
+            ids.add(prev_id)
+        return ids
+
+    @staticmethod
+    def _face_histogram(crop):
+        """Compute a normalized HSV (H+S) histogram feature vector.
+
+        Returns:
+            Normalized 2-D histogram, or None on invalid input.
+        """
+        try:
+            hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+            hist = cv2.calcHist([hsv], [0, 1], None,
+                                [32, 32], [0, 180, 0, 256])
+            cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
+            return hist
+        except cv2.error:
+            return None
+
+    @staticmethod
+    def _image_clarity(crop):
+        """Clarity/resolution score: Laplacian variance of the grayscale crop.
+
+        Sharper, higher-resolution crops score higher; used to keep the
+        best-quality image per physical identity.
+
+        Returns:
+            Float clarity score (0.0 when the crop is unusable).
+        """
+        try:
+            gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        except cv2.error:
+            return 0.0
+
+    def _face_hist_for_path(self, path):
+        """Return the cached HSV histogram for a stored crop file."""
+        if path not in self._face_hist_cache:
+            crop = cv2.imread(path, cv2.IMREAD_COLOR)
+            self._face_hist_cache[path] = (
+                self._face_histogram(crop) if crop is not None else None)
+        return self._face_hist_cache[path]
+
+    def _face_clarity_for(self, path):
+        """Return the cached clarity score for a stored crop file."""
+        if path not in self._face_clarity_cache:
+            crop = cv2.imread(path, cv2.IMREAD_COLOR)
+            self._face_clarity_cache[path] = (
+                self._image_clarity(crop) if crop is not None else 0.0)
+        return self._face_clarity_cache[path]
+
+    def _match_previous_face_crop(self, crop, track_id):
+        """Reuse an existing face crop when a track ID was reassigned.
+
+        ByteTrack can re-assign a person to a fresh ``track_id`` during a
+        partial occlusion (``#8`` -> ``#14``). Instead of comparing spatial
+        positions, this method compares **visual features**: the candidate
+        crop's HSV histogram is correlated against the histograms of every
+        stored employee crop. When the best correlation exceeds
+        ``face_sim_threshold`` (> 0.75) the crops show the same face:
+
+        - the current ``track_id`` is aliased to the stored identity;
+        - no new image file is created;
+        - if the candidate is clearer than the stored crop, the stored file
+          is replaced by it (keeping the best clarity version).
+
+        Args:
+            crop: Extracted candidate face crop (BGR).
             track_id: Newly observed track id to alias on a match.
-            frame_index: Current frame number, or None to disable recency.
 
         Returns:
             Relative path of the existing (reused) crop, or None when the
-            pending crop is considered a fresh identity.
+            candidate is considered a fresh identity.
         """
-        radius = size * self.face_dedup_radius_scale
-        for prev_id, previous in self._face_saved_regions.items():
+        candidate_hist = self._face_histogram(crop)
+        if candidate_hist is None:
+            return None
+
+        best_id = None
+        best_score = 0.0
+        rel_dir = os.path.relpath(self.faces_dir, self.root_dir)
+        for prev_id in self._iter_stored_face_ids():
             if prev_id == track_id:
                 continue
-            pcx, pcy = previous['center']
-            if np.hypot(center[0] - pcx, center[1] - pcy) > radius:
+            prev_path = os.path.join(self.faces_dir, f"pedestrian_{prev_id}.jpg")
+            prev_hist = self._face_hist_for_path(prev_path)
+            if prev_hist is None:
                 continue
-            if frame_index is not None and previous.get('frame') is not None \
-                    and (frame_index - previous['frame']) > self.face_dedup_window_frames:
-                continue
-            # Alias the reassigned id to the original exported identity.
-            self._saved_face_ids.add(track_id)
-            self._face_frame_counts.pop(track_id, None)
-            self._face_alias_map[track_id] = prev_id
-            return previous['path']
-        return None
+            score = cv2.compareHist(candidate_hist, prev_hist, cv2.HISTCMP_CORREL)
+            if score > best_score:
+                best_score = score
+                best_id = prev_id
+
+        if best_id is None or best_score <= self.face_sim_threshold:
+            return None
+
+        # Alias the reassigned id to the existing physical identity.
+        self._saved_face_ids.add(track_id)
+        self._face_frame_counts.pop(track_id, None)
+        self._face_alias_map[track_id] = best_id
+
+        # Keep the highest clarity candidate for the identity: the stored
+        # file is rewritten (not re-created) when the new crop is clearer.
+        best_path = os.path.join(self.faces_dir, f"pedestrian_{best_id}.jpg")
+        if self._image_clarity(crop) > self._face_clarity_for(best_path):
+            cv2.imwrite(best_path, crop)
+            self._face_hist_cache.pop(best_path, None)
+            self._face_clarity_cache[best_path] = self._image_clarity(crop)
+
+        return os.path.join(rel, f"pedestrian_{best_id}.jpg")
 
     def mark_frame_observations(self, observed_track_ids):
         """Reset consecutive observation streaks for absent face tracks.
@@ -1032,7 +1217,7 @@ class CropMemory:
             'face_aliases': len(self._face_alias_map),
             'unique_vehicles_saved': len(self._saved_vehicle_ids),
             'unique_plates_saved': len(self._saved_plate_ids),
-            'employees_tracked': len(self._employee_records),
+            'employees_tracked': len(self.get_employee_records()),
             'faces_dir': self.faces_dir,
             'vehicles_dir': self.vehicles_dir,
             'plates_dir': self.plates_dir
