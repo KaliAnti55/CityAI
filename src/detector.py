@@ -7,9 +7,12 @@ class CityDetector:
     Runs YOLOv8x inference with online multi-object tracking (ByteTrack
     via ``model.track``) so every object receives a persistent ``track_id``
     across frames. Preserves the feet-anchored IoP rider association logic.
+    In ``employee_mode`` the detection targets are restricted to ``person``
+    (COCO index 0) for workplace employee tracking.
     """
 
-    def __init__(self, model_path="yolov8x.pt", conf_thresh=0.25, iop_thresh=0.45, use_tracking=True):
+    def __init__(self, model_path="yolov8x.pt", conf_thresh=0.25, iop_thresh=0.45,
+                 use_tracking=True, employee_mode=False):
         # Accept either a loaded YOLO object or a string file path
         if isinstance(model_path, str):
             self.model = YOLO(model_path)
@@ -19,6 +22,7 @@ class CityDetector:
         self.conf_thresh = conf_thresh
         self.iop_thresh = iop_thresh
         self.use_tracking = use_tracking
+        self.employee_mode = employee_mode
         
         # Micro-mobility classes that allow active riders
         self.rider_vehicle_classes = ['bicycle', 'motorcycle']
@@ -26,15 +30,20 @@ class CityDetector:
         # Enclosed / heavy vehicles (tracked separately, cannot have open riders)
         self.enclosed_vehicle_classes = ['car', 'bus', 'truck']
         
-        # Target COCO class mapping
-        self.target_classes = {
-            0: 'person',
-            1: 'bicycle',
-            2: 'car',
-            3: 'motorcycle',
-            5: 'bus',
-            7: 'truck'
-        }
+        # Target COCO class mapping (restricted to person in employee mode)
+        if employee_mode:
+            self.target_classes = {
+                0: 'person'
+            }
+        else:
+            self.target_classes = {
+                0: 'person',
+                1: 'bicycle',
+                2: 'car',
+                3: 'motorcycle',
+                5: 'bus',
+                7: 'truck'
+            }
 
     def compute_feet_iop(self, ped_box, veh_box):
         px1, py1, px2, py2 = ped_box

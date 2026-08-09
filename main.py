@@ -1,6 +1,7 @@
 import argparse
 import os
 import json
+import time
 import cv2
 from src.detector import CityMobilityDetector
 from src.visualizer import Visualizer
@@ -27,6 +28,45 @@ def record_face_crops(frame, telemetry, memory):
         if crop_path is not None:
             person['face_crop_path'] = crop_path
     memory.mark_frame_observations(person_ids)
+
+def track_entry_exits(frame, telemetry, memory, frame_index):
+    """Update ENTRY/EXIT line-crossing telemetry for tracked employees.
+
+    Feeds each person's bounding box centroid into ``memory``, which
+    detects the crossing direction relative to the configured entry line
+    and logs events with per-track cooldown handling.
+    """
+    frame_height = frame.shape[0]
+    persons = telemetry.get('pedestrians', []) + telemetry.get('active_riders', [])
+    for person in persons:
+        track_id = person.get('track_id')
+        if track_id is None:
+            continue
+        memory.update_employee_crossing(track_id, person['bbox'], frame_height, frame_index)
+
+def track_employees(telemetry, memory, timestamp, frame_index):
+    """Update employee access telemetry for every tracked person.
+
+    Maintains per-``track_id`` first/last-seen timestamps, dwell time,
+    the ``zone_access_flag`` placeholder and the loitering flag via
+    ``memory``, mirroring the schema onto the person telemetry entries
+    for visualization and JSON export.
+    """
+    persons = telemetry.get('pedestrians', []) + telemetry.get('active_riders', [])
+    for person in persons:
+        track_id = person.get('track_id')
+        if track_id is None:
+            continue
+        memory.track_employee(track_id, timestamp, frame_index)
+        record = memory.get_employee_info(track_id)
+        if record is None:
+            continue
+        person['employee_track_id'] = record['employee_track_id']
+        person['first_seen_timestamp'] = record['first_seen_timestamp']
+        person['last_seen_timestamp'] = record['last_seen_timestamp']
+        person['dwell_time_seconds'] = record['dwell_time_seconds']
+        person['zone_access_flag'] = record['zone_access_flag']
+        person['is_loitering'] = record.get('is_loitering', False)
 
 def record_vehicle_crops(frame, telemetry, memory):
     """Persist vehicle and license plate crops for newly tracked vehicles.
@@ -73,6 +113,12 @@ def parse_args():
                         help="Comma-separated hotlist license plates (e.g., \"ABC1234,XYZ789,1234\")")
     parser.add_argument("--gemini-api-key", type=str, default=None,
                         help="Google Gemini API key for Vision OCR of license plates")
+    parser.add_argument("--employee-mode", action="store_true",
+                        help="Workplace employee tracking mode (person-only detection with access telemetry)")
+    parser.add_argument("--entry-line-y", type=float, default=0.5,
+                        help="Vertical position of the ENTRY/EXIT crossing line as a fraction of frame height")
+    parser.add_argument("--loitering-threshold", type=int, default=10,
+                        help="Dwell time in seconds after which an employee is flagged for loitering")
     return parser.parse_args()
 
 def main():
@@ -81,15 +127,18 @@ def main():
     # Handle source type (numeric string for camera index vs video file path)
     source = int(args.source) if args.source.isdigit() else args.source
     
-    detector = CityMobilityDetector(model_path=args.weights, conf_thresh=args.conf, iop_thresh=args.iop_thresh)
-    visualizer = Visualizer()
+    detector = CityMobilityDetector(model_path=args.weights, conf_thresh=args.conf,
+                                    iop_thresh=args.iop_thresh, employee_mode=args.employee_mode)
+    visualizer = Visualizer(employee_mode=args.employee_mode)
     target_plates = set()
     if args.target_plates:
         target_plates = {p.strip() for p in args.target_plates.split(',') if p.strip()}
     memory = CropMemory(plate_model=args.plate_weights, target_plates=target_plates,
                         telegram_token=args.telegram_token,
                         telegram_chat_id=args.telegram_chat_id,
-                        gemini_api_key=args.gemini_api_key)
+                        gemini_api_key=args.gemini_api_key,
+                        entry_line_y=args.entry_line_y,
+                        loitering_threshold=args.loitering_threshold)
     if memory.plate_model is None:
         print(f"[-] Plate model '{args.plate_weights}' unavailable; "
               f"falling back to geometric plate heuristic")
@@ -131,11 +180,17 @@ def main():
             
         frame_count += 1
         telemetry = detector.process_frame(frame)
+        if args.employee_mode:
+            track_employees(telemetry, memory, time.time(), frame_count)
+            track_entry_exits(frame, telemetry, memory, frame_count)
         record_face_crops(frame, telemetry, memory)
         record_vehicle_crops(frame, telemetry, memory)
         last_telemetry = telemetry
         
-        annotated_frame = visualizer.draw(frame, telemetry)
+        occupancy = memory.get_occupancy_state() if args.employee_mode else None
+        annotated_frame = visualizer.draw(frame, telemetry,
+                                          line_y=args.entry_line_y if args.employee_mode else None,
+                                          occupancy=occupancy)
         out_video.write(annotated_frame)
         
         if frame_count % 30 == 0:
@@ -160,11 +215,32 @@ def main():
           f"-> {memory_stats['vehicles_dir']}")
     print(f"[+] Unique plate crops saved: {memory_stats['unique_plates_saved']} "
           f"-> {memory_stats['plates_dir']}")
-    
+    if args.employee_mode:
+        print(f"[+] Employees tracked: {memory_stats['employees_tracked']}")
+        occ = memory.get_occupancy_state()
+        print(f"[+] Occupancy: {occ['current_occupancy']} | "
+              f"Entries: {occ['total_entries']} | Exits: {occ['total_exits']}")
+        print(f"[+] Attendance events logged: {len(memory.attendance_log)}")
+        print(f"[+] Loitering incidents: {len(memory.loitering_events)}")
+
     if args.save_json and last_telemetry is not None:
         json_path = "data/outputs/output.json"
+        if args.employee_mode:
+            report = dict(last_telemetry)
+            report['mode'] = 'employee_tracking'
+            report['employees'] = memory.get_employee_records()
+            report['attendance_log'] = memory.attendance_log
+            report['total_entries'] = memory.total_entries
+            report['total_exits'] = memory.total_exits
+            report['final_occupancy'] = memory.current_occupancy
+            report['loitering_threshold_seconds'] = memory.loitering_threshold
+            report['total_loitering_incidents'] = len(memory.loitering_events)
+            report['loitering_events'] = memory.loitering_events
+            telemetry_to_save = report
+        else:
+            telemetry_to_save = last_telemetry
         with open(json_path, 'w') as f:
-            json.dump(last_telemetry, f, indent=4)
+            json.dump(telemetry_to_save, f, indent=4)
         print(f"[+] Full video telemetry saved to: {json_path}")
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 import os
 import re
 import threading
+from datetime import datetime
 import cv2
 
 
@@ -25,7 +26,8 @@ class CropMemory:
                  plate_model=None, plate_conf_thresh=0.40, plate_min_aspect=1.5,
                  ocr_reader=None, ocr_conf_thresh=0.35,
                  target_plates=None, telegram_token=None, telegram_chat_id=None,
-                 gemini_api_key=None):
+                 gemini_api_key=None, entry_line_y=0.5, crossing_cooldown_frames=30,
+                 loitering_threshold=10):
         """Initialize the crop memory store.
 
         Args:
@@ -54,6 +56,15 @@ class CropMemory:
                 Gemini Vision API OCR for plate text (falls back to the
                 local OCR backend when the API call fails or no key is
                 provided).
+            entry_line_y: Vertical position of the virtual ENTRY/EXIT
+                crossing line as a fraction of the frame height (default
+                0.5 = middle of the frame).
+            crossing_cooldown_frames: Minimum frames between crossing
+                events logged for the same ``track_id`` to suppress
+                duplicates.
+            loitering_threshold: Dwell time in seconds after which an
+                employee is flagged as loitering and a loitering event
+                is recorded (default 10).
         """
         self.root_dir = root_dir
         self.faces_dir = os.path.join(root_dir, faces_subdir)
@@ -74,6 +85,17 @@ class CropMemory:
         self._ocr_backend = None
         self._plate_texts = {}
         self.gemini_api_key = gemini_api_key
+        self._employee_records = {}
+        self._employee_first_epochs = {}
+        self.entry_line_y = entry_line_y
+        self.crossing_cooldown_frames = crossing_cooldown_frames
+        self.attendance_log = []
+        self.total_entries = 0
+        self.total_exits = 0
+        self.current_occupancy = 0
+        self._crossing_states = {}
+        self.loitering_threshold = loitering_threshold
+        self.loitering_events = []
         self.target_plates = set()
         if target_plates:
             for target in target_plates:
@@ -371,6 +393,138 @@ class CropMemory:
                     print("[-] Telegram alert skipped: no HTTP client available")
         except Exception as exc:
             print(f"[-] Telegram alert failed (track #{track_id}): {exc}")
+
+    def track_employee(self, track_id, timestamp_epoch, frame_index=None):
+        """Update the employee access telemetry record for a person track.
+
+        Creates the record on first sighting (including the
+        ``zone_access_flag`` placeholder for future spatial restriction
+        checks, and ``is_loitering`` for dwell-time alerting) and
+        refreshes ``last_seen_timestamp`` and ``dwell_time_seconds`` on
+        every subsequent observation. When an employee's dwell time
+        exceeds ``loitering_threshold`` seconds, the record is marked
+        with ``is_loitering = True`` and a single loitering event is
+        appended to ``loitering_events`` (once per unique track ID).
+
+        Args:
+            track_id: Unique tracking identifier of the person.
+            timestamp_epoch: Observation time as epoch seconds.
+            frame_index: Optional frame number used in the loitering
+                event log for traceability.
+        """
+        record = self._employee_records.get(track_id)
+        if record is None:
+            self._employee_records[track_id] = {
+                'employee_track_id': track_id,
+                'first_seen_timestamp': datetime.fromtimestamp(timestamp_epoch).isoformat(),
+                'last_seen_timestamp': datetime.fromtimestamp(timestamp_epoch).isoformat(),
+                'dwell_time_seconds': 0.0,
+                'zone_access_flag': False,
+                'is_loitering': False
+            }
+            self._employee_first_epochs[track_id] = timestamp_epoch
+            return
+        record['last_seen_timestamp'] = datetime.fromtimestamp(timestamp_epoch).isoformat()
+        record['dwell_time_seconds'] = round(
+            timestamp_epoch - self._employee_first_epochs[track_id], 2)
+        if record.get('is_loitering'):
+            return
+        if record['dwell_time_seconds'] > self.loitering_threshold:
+            record['is_loitering'] = True
+            self.loitering_events.append({
+                'track_id': track_id,
+                'dwell_time_seconds': record['dwell_time_seconds'],
+                'first_seen': record['first_seen_timestamp'],
+                'timestamp': datetime.fromtimestamp(timestamp_epoch).isoformat(),
+                'frame_index': frame_index
+            })
+
+    def get_employee_info(self, track_id):
+        """Return the access telemetry record for one person track.
+
+        Args:
+            track_id: Unique tracking identifier of the person.
+
+        Returns:
+            Employee telemetry dictionary, or None when unknown.
+        """
+        return self._employee_records.get(track_id)
+
+    def get_employee_records(self):
+        """Return the aggregated access telemetry for all tracked employees.
+
+        Returns:
+            List of employee telemetry records (one per unique track id).
+        """
+        return list(self._employee_records.values())
+
+    def update_employee_crossing(self, track_id, bbox, frame_height, frame_index):
+        """Log ENTRY/EXIT crossing events and maintain occupancy counters.
+
+        Compares the current bounding-box centroid (``cy = y1 + (y2 - y1)/2``)
+        against the centroid from the previous observed frame, relative to
+        the entry line at ``Y = frame_height * entry_line_y``:
+        - a top-to-bottom crossing triggers ``ENTRY``;
+        - a bottom-to-top crossing triggers ``EXIT``.
+        A per-track cooldown suppresses duplicate events.
+
+        Args:
+            track_id: Unique tracking identifier of the person.
+            bbox: (x1, y1, x2, y2) person bounding box.
+            frame_height: Height of the current frame in pixels.
+            frame_index: Global frame index used for event logging.
+        """
+        cy = bbox[1] + (bbox[3] - bbox[1]) / 2.0
+        line_y = frame_height * self.entry_line_y
+
+        state = self._crossing_states.get(track_id)
+        if state is None:
+            self._crossing_states[track_id] = {'frame': frame_index, 'cy': cy}
+            return
+
+        prev_cy = state['cy']
+        state['cy'] = cy
+        state['frame'] = frame_index
+
+        if prev_cy < line_y and cy >= line_y:
+            event_type = 'ENTRY'
+        elif prev_cy >= line_y and cy < line_y:
+            event_type = 'EXIT'
+        else:
+            return
+
+        last_event_frame = state.get('last_event_frame')
+        if last_event_frame is not None and \
+                (frame_index - last_event_frame) < self.crossing_cooldown_frames:
+            return
+
+        state['last_event_frame'] = frame_index
+        if event_type == 'ENTRY':
+            self.total_entries += 1
+            self.current_occupancy += 1
+        else:
+            self.total_exits += 1
+            self.current_occupancy -= 1
+
+        self.attendance_log.append({
+            'track_id': track_id,
+            'event_type': event_type,
+            'timestamp': datetime.now().isoformat(),
+            'frame_index': frame_index
+        })
+
+    def get_occupancy_state(self):
+        """Return the live entry/exit occupancy counters.
+
+        Returns:
+            Dictionary with ``total_entries``, ``total_exits`` and
+            ``current_occupancy`` (entries minus exits).
+        """
+        return {
+            'total_entries': self.total_entries,
+            'total_exits': self.total_exits,
+            'current_occupancy': self.current_occupancy
+        }
 
     def compute_head_region(self, bbox, head_fraction=0.40, width_expansion=0.15):
         """Compute the head/shoulder region of a pedestrian bounding box.
@@ -680,6 +834,7 @@ class CropMemory:
             'unique_faces_saved': len(self._saved_face_ids),
             'unique_vehicles_saved': len(self._saved_vehicle_ids),
             'unique_plates_saved': len(self._saved_plate_ids),
+            'employees_tracked': len(self._employee_records),
             'faces_dir': self.faces_dir,
             'vehicles_dir': self.vehicles_dir,
             'plates_dir': self.plates_dir
