@@ -30,7 +30,7 @@ class CropMemory:
                  target_plates=None, telegram_token=None, telegram_chat_id=None,
                  gemini_api_key=None, entry_line_y=0.5, crossing_cooldown_frames=30,
                  loitering_threshold=10, face_min_ratio=0.75, face_max_ratio=1.75,
-                 face_min_size=24, face_sim_threshold=0.75, face_match_distance=0.40):
+                 face_min_size=24, face_sim_threshold=0.75, face_match_distance=0.50):
         """Initialize the crop memory store.
 
         Args:
@@ -84,7 +84,7 @@ class CropMemory:
             face_match_distance: Cosine distance threshold for the DeepFace
                 embedding backend; a candidate crop within this distance of
                 a stored crop is matched to the same physical identity
-                (default 0.40).
+                (default 0.50).
         """
         self.root_dir = root_dir
         self.faces_dir = os.path.join(root_dir, faces_subdir)
@@ -728,30 +728,6 @@ class CropMemory:
             'current_occupancy': self.current_occupancy
         }
 
-    def compute_head_region(self, bbox, head_fraction=0.40, width_expansion=0.15):
-        """Compute the head/shoulder region of a pedestrian bounding box.
-
-        The region spans the box width expanded outward by
-        ``width_expansion`` (15% per side by default) and the top
-        ``head_fraction`` of the box height (default top 40% captures the
-        full facial geometry including chin and mouth). Out-of-frame
-        expansion is clamped to the frame borders at save time.
-
-        Args:
-            bbox: (x1, y1, x2, y2) pedestrian bounding box.
-            head_fraction: Fraction of the box height used for the crop.
-            width_expansion: Fraction of the box width added on each side.
-
-        Returns:
-            Tuple (x1, y1, x2, y2) describing the head region.
-        """
-        x1, y1, x2, y2 = bbox
-        width = x2 - x1
-        height = y2 - y1
-        expand = width * width_expansion
-        head_y2 = y1 + height * head_fraction
-        return (x1 - expand, y1, x2 + expand, head_y2)
-
     def compute_plate_region(self, bbox, bottom_fraction=0.35, center_fraction=0.60):
         """Compute the license plate region of a vehicle bounding box.
 
@@ -835,38 +811,44 @@ class CropMemory:
         rel_path = os.path.join(os.path.relpath(directory, self.root_dir), filename)
         return rel_path
 
-    def save_face_crop(self, frame, bbox, track_id, head_fraction=0.40,
-                       width_expansion=0.15, min_stable_frames=5, frame_index=None):
-        """Save the face/head crop for a stable unique pedestrian, exactly once.
+    def save_face_crop(self, frame, bbox, track_id, face_bbox=None,
+                       min_stable_frames=5, frame_index=None):
+        """Save the directly detected face crop for a stable pedestrian, once.
 
         The crop is only triggered once the ``track_id`` has been observed
-        for at least ``min_stable_frames`` consecutive frames, so
-        detections early in a track (low confidence or unstable boxes)
-        never produce a crop. Each unique ``track_id`` is still saved
-        exactly once.
+        for at least ``min_stable_frames`` consecutive frames, so unstable
+        detections early in a track never produce a crop. Each unique
+        ``track_id`` is still saved exactly once.
 
-        Before persisting, the head region is verified for **face quality**:
-        its height/width aspect ratio must sit inside
-        ``(face_min_ratio, face_max_ratio)`` (a chopped forehead-only or
-        distended laptop-edge box is dropped) and it must not be cut off by
-        the frame borders. Crops failing this check are ignored for the
-        frame and retried on subsequent frames.
+        The crop region is the **explicitly detected face box** delivered by
+        the dedicated face detector stage (``face_bbox`` from
+        ``CityDetector.detect_faces``). No percentage-based top-body slicing
+        is applied; when no face box is available the attempt is skipped for
+        the frame and retried on subsequent frames.
+
+        Before persisting, the face box is verified for **face quality**:
+        its height/width aspect ratio must sit inside ``(face_min_ratio,
+        face_max_ratio)`` (a chopped forehead-only or distended laptop-edge
+        box is dropped), both sides must be at least ``face_min_size``
+        pixels, and it must not be cut off by the frame borders. Crops
+        failing this check are ignored for the frame and retried later.
 
         When the crop passes, its **facial identity** is verified against
         every stored employee crop in ``data/outputs/crops/faces/`` using
         a DeepFace (FaceNet) 512-D embedding: the closest stored identity
-        with cosine distance < ``face_match_distance`` (0.40) is aliased —
+        with cosine distance < ``face_match_distance`` (0.50) is aliased —
         no new image is written, and if the candidate is clearer than the
         stored image the stored file is replaced (identity image is always
-        the highest-clarity version). When DeepFace is unavailable the
-        matcher gracefully falls back to HSV histogram correlation.
+        the highest-clarity version).
 
         Args:
             frame: Current video frame (BGR).
-            bbox: (x1, y1, x2, y2) pedestrian bounding box.
+            bbox: (x1, y1, x2, y2) pedestrian bounding box (stability
+                tracking only).
             track_id: Unique tracking identifier of the pedestrian.
-            head_fraction: Fraction of the box height used for the crop.
-            width_expansion: Fraction of the box width added on each side.
+            face_bbox: (x1, y1, x2, y2) directly detected face box in
+                absolute frame coordinates, or None when the face detector
+                produced no box this frame.
             min_stable_frames: Minimum consecutive frames the track must
                 be observed for before the crop is saved.
             frame_index: Optional current frame number (recorded with the
@@ -884,7 +866,9 @@ class CropMemory:
         if count < min_stable_frames:
             return None
 
-        region = self.compute_head_region(bbox, head_fraction, width_expansion)
+        region = face_bbox
+        if region is None:
+            return None
 
         # Quality gate: full, unclipped face only (aspect ratio + borders).
         if not self._face_geometry_ok(region, frame.shape):
@@ -895,7 +879,7 @@ class CropMemory:
         if crop is None:
             return None
 
-        # Visual similarity deduplication: reuse the existing crop file when
+        # Identity-based deduplication: reuse the existing crop file when
         # the same physical face was already exported under another id.
         alias_path = self._match_previous_face_crop(crop, track_id)
         if alias_path is not None:
@@ -1080,7 +1064,7 @@ class CropMemory:
           against the embeddings of every stored employee crop in
           ``data/outputs/crops/faces/``;
         - the closest identity with cosine distance < ``face_match_distance``
-          (0.40 by default) is the same physical person: the current
+          (0.50 by default) is the same physical person: the current
           ``track_id`` is aliased to that identity, no new image file is
           created, and if the candidate is clearer than the stored crop the
           stored file is replaced by it (highest clarity kept).

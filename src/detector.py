@@ -59,7 +59,7 @@ class CityDetector:
 
     def __init__(self, model_path="yolov8x.pt", conf_thresh=0.25, iop_thresh=0.45,
                  use_tracking=True, employee_mode=False, nms_iou_thresh=0.45,
-                 track_buffer=60, match_thresh=0.8):
+                 track_buffer=60, match_thresh=0.8, face_detector_backend="opencv"):
         # Accept either a loaded YOLO object or a string file path
         if isinstance(model_path, str):
             self.model = YOLO(model_path)
@@ -70,6 +70,13 @@ class CityDetector:
         self.iop_thresh = iop_thresh
         self.use_tracking = use_tracking
         self.employee_mode = employee_mode
+
+        # Face detection stage: DeepFace built-in detector backend (retinaface,
+        # mtcnn, opencv, ssd, ...) run on the raw frame. "none"/"disabled"
+        # turns the explicit face stage off entirely.
+        backend = (face_detector_backend or "").strip().lower()
+        self.face_detector_backend = None if backend in ("", "none", "disabled") else backend
+        self._face_detector = None
 
         # NMS pre-filtering for duplicate/overlapping person boxes
         self.nms_iou_thresh = nms_iou_thresh
@@ -164,6 +171,87 @@ class CityDetector:
             pass
         return None
 
+    @staticmethod
+    def bbox_iou(box_a, box_b):
+        """IoU between two absolute ``(x1, y1, x2, y2)`` boxes (floats)."""
+        ax1, ay1, ax2, ay2 = box_a
+        bx1, by1, bx2, by2 = box_b
+        ix1 = max(ax1, bx1)
+        iy1 = max(ay1, by1)
+        ix2 = min(ax2, bx2)
+        iy2 = min(ay2, by2)
+        inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
+        area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+        area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
+        union = area_a + area_b - inter
+        return inter / union if union > 0 else 0.0
+
+    def detect_faces(self, frame):
+        """Run the configured DeepFace face detector on the raw video frame.
+
+        Produces explicit face bounding boxes from face landmark/detection
+        outputs (retinaface, mtcnn or opencv backends) instead of relying
+        on percentage-based body slicing later in the pipeline.
+
+        Args:
+            frame: Current video frame (BGR).
+
+        Returns:
+            List of ``(x1, y1, x2, y2, confidence)`` face boxes in absolute
+            frame coordinates; empty when the stage is disabled or the
+            backend is unavailable.
+        """
+        if self.face_detector_backend is None:
+            return []
+        if self._face_detector is None:
+            try:
+                from deepface import DeepFace
+                self._face_detector = DeepFace
+            except Exception:
+                self._face_detector = False
+        if not self._face_detector:
+            return []
+        try:
+            results = self._face_detector.extract_faces(
+                img_path=frame, detector_backend=self.face_detector_backend,
+                enforce_detection=False, align=False)
+            boxes = []
+            for result in results:
+                area = result.get('facial_area')
+                if not area:
+                    continue
+                confidence = float(result.get('confidence') or 0.0)
+                fx, fy, fw, fh = area['x'], area['y'], area['w'], area['h']
+                boxes.append((fx, fy, fx + fw, fy + fh, confidence))
+            return boxes
+        except Exception:
+            return []
+
+    def _assign_face_boxes(self, face_boxes, persons):
+        """Attach detected face boxes to the closest overlapping person.
+
+        Each face box is greedily assigned to the tracked person whose
+        bounding box has the highest IoU with it (min IoU 0.05), so a
+        person never consumes another person's face. Persons keep an
+        explicit ``face_bbox`` used later for direct face cropping.
+
+        Args:
+            face_boxes: List of ``(x1, y1, x2, y2, confidence)`` boxes.
+            persons: List of person telemetry items (mutated in place).
+        """
+        for fx1, fy1, fx2, fy2, _confidence in face_boxes:
+            best_person = None
+            best_iou = 0.0
+            for person in persons:
+                if 'face_bbox' in person:
+                    continue
+                iou = self.bbox_iou(person['bbox'], [fx1, fy1, fx2, fy2])
+                if iou > best_iou:
+                    best_iou = iou
+                    best_person = person
+            if best_person is not None and best_iou >= 0.05:
+                best_person['face_bbox'] = [fx1, fy1, fx2, fy2]
+
     def process_frame(self, frame):
         results = self._run_inference(frame)
         
@@ -232,7 +320,15 @@ class CityDetector:
                 active_riders.append(ped_copy)
             else:
                 standalone_pedestrians.append(ped)
-                
+
+        # Explicit face detection: detect faces directly on the raw frame and
+        # bind each detected face box to the person it belongs to, enabling
+        # direct face cropping (no body-ratio head slicing) downstream.
+        face_boxes = self.detect_faces(frame)
+        if face_boxes:
+            self._assign_face_boxes(face_boxes,
+                                    standalone_pedestrians + active_riders)
+
         all_vehicles = rider_eligible_vehicles + enclosed_vehicles
         
         telemetry = {

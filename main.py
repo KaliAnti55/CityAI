@@ -28,6 +28,7 @@ def record_face_crops(frame, telemetry, memory, frame_index):
             continue
         person_ids.add(track_id)
         crop_path = memory.save_face_crop(frame, person['bbox'], track_id,
+                                          face_bbox=person.get('face_bbox'),
                                           frame_index=frame_index)
         if crop_path is not None:
             person['face_crop_path'] = crop_path
@@ -131,6 +132,8 @@ def parse_args():
                         help="ByteTrack buffer length in frames (higher values survive occlusions without new track IDs)")
     parser.add_argument("--match-thresh", type=float, default=0.8,
                         help="ByteTrack matching threshold used for tracker persistence")
+    parser.add_argument("--face-detector", type=str, default="opencv",
+                        help="Face detection backend for direct face cropping (deepface backends: opencv, mtcnn, retinaface, ssd; 'none' disables)")
     return parser.parse_args()
 
 def main():
@@ -143,7 +146,8 @@ def main():
                                     iop_thresh=args.iop_thresh, employee_mode=args.employee_mode,
                                     nms_iou_thresh=args.nms_iou_thresh,
                                     track_buffer=args.track_buffer,
-                                    match_thresh=args.match_thresh)
+                                    match_thresh=args.match_thresh,
+                                    face_detector_backend=args.face_detector)
     visualizer = Visualizer(employee_mode=args.employee_mode)
     target_plates = set()
     if args.target_plates:
