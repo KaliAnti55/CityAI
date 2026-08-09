@@ -1,6 +1,7 @@
 import os
 import re
 import threading
+import time
 from datetime import datetime
 import numpy as np
 import cv2
@@ -96,6 +97,7 @@ class CropMemory:
         self.gemini_api_key = gemini_api_key
         self._employee_records = {}
         self._employee_first_epochs = {}
+        self.monitor_start_epoch = time.time()
         self.entry_line_y = entry_line_y
         self.crossing_cooldown_frames = crossing_cooldown_frames
         self.attendance_log = []
@@ -431,6 +433,8 @@ class CropMemory:
                 'employee_track_id': track_id,
                 'first_seen_timestamp': datetime.fromtimestamp(timestamp_epoch).isoformat(),
                 'last_seen_timestamp': datetime.fromtimestamp(timestamp_epoch).isoformat(),
+                'first_seen_frame': frame_index,
+                'last_seen_frame': frame_index,
                 'dwell_time_seconds': 0.0,
                 'zone_access_flag': False,
                 'is_loitering': False
@@ -438,6 +442,7 @@ class CropMemory:
             self._employee_first_epochs[track_id] = timestamp_epoch
             return
         record['last_seen_timestamp'] = datetime.fromtimestamp(timestamp_epoch).isoformat()
+        record['last_seen_frame'] = frame_index
         record['dwell_time_seconds'] = round(
             timestamp_epoch - self._employee_first_epochs[track_id], 2)
         if record.get('is_loitering'):
@@ -470,6 +475,114 @@ class CropMemory:
             List of employee telemetry records (one per unique track id).
         """
         return list(self._employee_records.values())
+
+    @staticmethod
+    def _format_duration(seconds):
+        """Format a duration in seconds as a compact human-readable string.
+
+        Args:
+            seconds: Duration in seconds (float or int), or None.
+
+        Returns:
+            e.g. ``"34.2 s"`` for sub-minute durations or ``"2m 5s"``
+            otherwise (``"0 s"`` when unknown/None).
+        """
+        if not seconds:
+            return "0 s"
+        if seconds < 60:
+            return f"{seconds:.1f} s"
+        minutes, secs = divmod(int(seconds), 60)
+        return f"{minutes}m {secs}s"
+
+    def _face_crop_path_for(self, track_id):
+        """Resolve the exported face crop path for a track id.
+
+        Honors track-ID-switch aliases: a reassigned id maps back to the
+        originally exported crop for the same physical person.
+
+        Args:
+            track_id: ``employee_track_id`` (or pedestrian) of the person.
+
+        Returns:
+            Project-relative crop path (e.g.
+            ``data/outputs/crops/faces/pedestrian_1.jpg``), or None when
+            no face crop was captured for the identity.
+        """
+        if track_id in self._face_alias_map:
+            track_id = self._face_alias_map[track_id]
+        if track_id not in self._saved_face_ids:
+            return None
+        filename = f"pedestrian_{track_id}.jpg"
+        rel_dir = os.path.relpath(self.faces_dir, self.root_dir)
+        return os.path.join(self.root_dir, rel_dir, filename)
+
+    def export_markdown_report(self, output_path):
+        """Write a human-readable Markdown activity report.
+
+        Produces an executive summary at the top (total employees tracked,
+        active monitoring duration and total loitering incidents) followed
+        by one detail block per tracked employee / pedestrian Track ID
+        covering first/last seen, total active dwell time, loitering
+        status and the associated face crop path.
+
+        Args:
+            output_path: Destination file path for the ``.md`` report.
+
+        Returns:
+            ``output_path`` on success, or None when no employees were
+            tracked (nothing meaningful to report).
+        """
+        records = self.get_employee_records()
+        if not records:
+            return None
+
+        duration = None
+        if self.monitor_start_epoch is not None:
+            duration = self._format_duration(time.time() - self.monitor_start_epoch)
+
+        lines = []
+        lines.append("# CityAI Employee Activity Report")
+        lines.append("")
+        lines.append("## Executive Summary")
+        lines.append("")
+        lines.append(f"- **Total Employees Tracked:** {len(records)}")
+        lines.append(f"- **Active Monitoring Duration:** {duration or 'unknown'}")
+        lines.append(f"- **Total Loitering Incidents:** {len(self.loitering_events)}")
+        lines.append("")
+        lines.append("## Employee Activity Details")
+        lines.append("")
+
+        for record in sorted(records, key=lambda r: r.get('employee_track_id') or 0):
+            track_id = record.get('employee_track_id')
+            first_seen = record.get('first_seen_timestamp') or 'n/a'
+            last_seen = record.get('last_seen_timestamp') or 'n/a'
+            first_frame = record.get('first_seen_frame')
+            last_frame = record.get('last_seen_frame')
+            dwell = record.get('dwell_time_seconds')
+            is_loitering = bool(record.get('is_loitering'))
+            status = ("Loitering Threshold Exceeded" if is_loitering
+                      else "Normal")
+            face_path = self._face_crop_path_for(track_id)
+
+            lines.append(f"### Employee #{track_id}")
+            lines.append("")
+            lines.append(f"- **First Seen:** {first_seen}"
+                         f"{f' (frame {first_frame})' if first_frame is not None else ''}")
+            lines.append(f"- **Last Seen:** {last_seen}"
+                         f"{f' (frame {last_frame})' if last_frame is not None else ''}")
+            lines.append(f"- **Total Active Dwell Time:** "
+                         f"{self._format_duration(dwell)}")
+            lines.append(f"- **Dwell / Loitering Status:** {status}")
+            if face_path:
+                lines.append(f"- **Face Crop:** `{face_path}`")
+            else:
+                lines.append("- **Face Crop:** _not captured_")
+            lines.append("")
+
+        with open(output_path, 'w') as f:
+            f.write("\n".join(lines))
+
+        return output_path
 
     def update_employee_crossing(self, track_id, bbox, frame_height, frame_index):
         """Log ENTRY/EXIT crossing events and maintain occupancy counters.

@@ -109,6 +109,8 @@ def parse_args():
     parser.add_argument("--iop-thresh", type=float, default=0.45, help="Feet IoP threshold for riders")
     parser.add_argument("--no-display", action="store_true", help="Disable GUI display window")
     parser.add_argument("--save-json", action="store_true", help="Save output telemetry JSON")
+    parser.add_argument("--save-md", action="store_true",
+                        help="Save the Markdown activity report (auto-enabled in --employee-mode or with --save-json)")
     parser.add_argument("--telegram-token", type=str, default=None,
                         help="Telegram Bot Token for hotlist plate alerts")
     parser.add_argument("--telegram-chat-id", type=str, default=None,
@@ -255,6 +257,18 @@ def main():
         with open(json_path, 'w') as f:
             json.dump(telemetry_to_save, f, indent=4)
         print(f"[+] Full video telemetry saved to: {json_path}")
+
+    # Markdown activity report: explicit flag, employee mode, or alongside
+    # an existing telemetry export. Written beside the JSON output (or as
+    # ``<output_path_basename>.md`` when a JSON export exists).
+    save_md = args.save_md or bool(args.employee_mode) or args.save_json
+    if save_md and memory.get_employee_records():
+        md_path = "data/outputs/activity_report.md"
+        exported = memory.export_markdown_report(md_path)
+        if exported:
+            print(f"[+] Employee activity report saved to: {md_path}")
+        else:
+            print("[-] Markdown report skipped: no employees were tracked")
 
 if __name__ == "__main__":
     main()
