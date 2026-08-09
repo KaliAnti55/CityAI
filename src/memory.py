@@ -914,7 +914,7 @@ class CropMemory:
         Returns:
             True when the region looks like a full, unobstructed face.
         """
-        h, w = frame_size[:2]
+        h, w = frame_shape[:2]
         x1, y1, x2, y2 = region
         rw = x2 - x1
         rh = y2 - y1
