@@ -1,5 +1,14 @@
+import os
+import json
+
 import numpy as np
 from ultralytics import YOLO
+
+GEMINI_FACE_SYSTEM_INSTRUCTION = (
+    "You are a precision face detector. Detect all visible human face "
+    "coordinates in the provided image. Do not detect objects, monitors, "
+    "or furniture."
+)
 
 def non_max_suppression(boxes, scores, iou_thresh=0.45):
     """Greedy Non-Maximum Suppression over absolute ``(x1, y1, x2, y2)`` boxes.
@@ -71,12 +80,33 @@ class CityDetector:
         self.use_tracking = use_tracking
         self.employee_mode = employee_mode
 
-        # Face detection stage: DeepFace built-in detector backend (retinaface,
-        # mtcnn, opencv, ssd, ...) run on the raw frame. "none"/"disabled"
-        # turns the explicit face stage off entirely.
+        # Face detection stage: a dedicated face detector runs on the raw
+        # frame and binds explicit face boxes (``face_bbox``) to tracked
+        # persons for direct face cropping downstream.
+        #
+        #   "gemini" -> Gemini vision model primary, OpenCV (DeepFace)
+        #               fallback when the API key is missing or calls fail
+        #   "auto"   -> Gemini when GEMINI_API_KEY/GOOGLE_API_KEY is present,
+        #               otherwise the local OpenCV detector (default)
+        #   <backend>-> local DeepFace built-in detector (retinaface, mtcnn,
+        #               opencv, ssd, ...)
+        #   "none"   -> explicit face stage disabled entirely
         backend = (face_detector_backend or "").strip().lower()
-        self.face_detector_backend = None if backend in ("", "none", "disabled") else backend
+        gemini_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+        if backend in ("", "none", "disabled"):
+            self.face_detector_backend = None
+            self._gemini_enabled = False
+        elif backend == "gemini":
+            self.face_detector_backend = "opencv"  # local fallback backend
+            self._gemini_enabled = True
+        elif backend == "auto":
+            self.face_detector_backend = "opencv"
+            self._gemini_enabled = bool(gemini_key)
+        else:
+            self.face_detector_backend = backend
+            self._gemini_enabled = False
         self._face_detector = None
+        self._gemini_client = None
 
         # NMS pre-filtering for duplicate/overlapping person boxes
         self.nms_iou_thresh = nms_iou_thresh
@@ -187,11 +217,125 @@ class CityDetector:
         return inter / union if union > 0 else 0.0
 
     def detect_faces(self, frame):
-        """Run the configured DeepFace face detector on the raw video frame.
+        """Top-level face detector: Gemini when enabled, local otherwise.
 
-        Produces explicit face bounding boxes from face landmark/detection
-        outputs (retinaface, mtcnn or opencv backends) instead of relying
-        on percentage-based body slicing later in the pipeline.
+        Routes to ``detect_faces_gemini`` when the Gemini mode is active
+        (``--face-detector gemini``, or ``auto`` with an API key present).
+        When Gemini is unavailable (no API key, package missing, API error)
+        or returns no boxes, detection falls back gracefully to the local
+        detector so the pipeline never stalls.
+
+        Args:
+            frame: Current video frame (BGR).
+
+        Returns:
+            List of ``(x1, y1, x2, y2, confidence)`` face boxes in absolute
+            frame coordinates; empty when the stage is disabled entirely.
+        """
+        if self._gemini_enabled:
+            face_boxes = self.detect_faces_gemini(frame)
+            if face_boxes:
+                return face_boxes
+            # Graceful fallback: the local backend is pinned to "opencv" in
+            # gemini/auto modes, so the fallback is always OpenCV.
+        return self._detect_faces_local(frame)
+
+    def detect_faces_gemini(self, frame):
+        """Detect human faces with a Gemini vision model producing native boxes.
+
+        Sends the raw frame to the model under the JSON response contract
+        ``{"faces": [{"box_2d": [ymin, xmin, ymax, xmax]}]}`` where all
+        coordinates are normalized on a 0-1000 scale, then converts them
+        to absolute pixel coordinates.
+
+        Args:
+            frame: Current video frame (BGR).
+
+        Returns:
+            List of ``(x1, y1, x2, y2, None)`` face boxes in absolute frame
+            coordinates; empty when the API key is missing, the
+            ``google-genai`` package is unavailable or the API call fails
+            (callers then fall back to the local detector).
+        """
+        try:
+            if self._gemini_client is None:
+                api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+                if not api_key:
+                    return []
+                try:
+                    from google import genai
+                except Exception:
+                    self._gemini_client = False
+                    return []
+                self._gemini_client = genai.Client(api_key=api_key)
+            if not self._gemini_client:
+                return []
+
+            from google.genai import types
+
+            import cv2
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            success, jpg = cv2.imencode(".jpg", rgb)
+            if not success:
+                return []
+            image_part = types.Part.from_bytes(data=jpg.tobytes(),
+                                               mime_type="image/jpeg")
+
+            model = os.environ.get("GEMINI_FACE_MODEL", "gemini-3.5-flash-lite")
+            config = types.GenerateContentConfig(
+                system_instruction=GEMINI_FACE_SYSTEM_INSTRUCTION,
+                response_mime_type="application/json",
+                response_schema=types.Schema(
+                    type=types.Type.OBJECT,
+                    properties={
+                        "faces": types.Schema(
+                            type=types.Type.ARRAY,
+                            items=types.Schema(
+                                type=types.Type.OBJECT,
+                                properties={
+                                    "box_2d": types.Schema(
+                                        type=types.Type.ARRAY,
+                                        items=types.Schema(type=types.Type.NUMBER),
+                                    )
+                                },
+                            ),
+                        )
+                    },
+                ),
+            )
+            response = self._gemini_client.models.generate_content(
+                model=model,
+                contents=[image_part, "Detect all faces. Return only the JSON face boxes."],
+                config=config)
+            text = (response.text or "").strip()
+            if not text:
+                return []
+            # Tolerate code-fence or verbose wraps around the JSON payload.
+            if text.startswith("```"):
+                text = text.strip("`")
+            start, end = text.find("{"), text.rfind("}")
+            payload = json.loads(text[start:end + 1] if start != -1 else text)
+
+            h, w = frame.shape[:2]
+            boxes = []
+            for face in payload.get("faces", []) or []:
+                box = face.get("box_2d")
+                if not box or len(box) != 4:
+                    continue
+                ymin, xmin, ymax, xmax = (float(v) for v in box)
+                boxes.append((
+                    xmin * w / 1000.0,
+                    ymin * h / 1000.0,
+                    xmax * w / 1000.0,
+                    ymax * h / 1000.0,
+                    None,
+                ))
+            return boxes
+        except Exception:
+            return []
+
+    def _detect_faces_local(self, frame):
+        """Run the configured local (DeepFace) face detector on the frame.
 
         Args:
             frame: Current video frame (BGR).
